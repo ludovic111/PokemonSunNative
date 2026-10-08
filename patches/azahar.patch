@@ -1,0 +1,190 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2a6dcb94f..70cca7dc6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -222,7 +222,7 @@ if (CITRA_USE_PRECOMPILED_HEADERS)
+     endif()
+ endif()
+ 
+-if(NOT EXISTS ${PROJECT_SOURCE_DIR}/.git/hooks/pre-commit)
++if(IS_DIRECTORY ${PROJECT_SOURCE_DIR}/.git AND NOT EXISTS ${PROJECT_SOURCE_DIR}/.git/hooks/pre-commit)
+     message(STATUS "Copying pre-commit hook")
+     file(COPY hooks/pre-commit
+         DESTINATION ${PROJECT_SOURCE_DIR}/.git/hooks)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 329af28d2..f48c53271 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -227,3 +227,8 @@ endif()
+ if (ENABLE_WEB_SERVICE)
+     add_subdirectory(web_service)
+ endif()
++
++# PokemonSunNative: the native game executable, built against the libraries above
++if (PSN_SOURCE_DIR)
++    add_subdirectory(${PSN_SOURCE_DIR}/cmake ${CMAKE_BINARY_DIR}/psn)
++endif()
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 00a3ac682..8569da809 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ add_library(citra_core STATIC EXCLUDE_FROM_ALL
+     3ds.h
+     arm/arm_interface.h
++    arm/external_cpu.h
+     arm/exception_handler.cpp
+     arm/exception_handler.h
+     arm/dyncom/arm_dyncom.cpp
+diff --git a/src/core/arm/arm_interface.h b/src/core/arm/arm_interface.h
+index f9d126afd..091a9964b 100644
+--- a/src/core/arm/arm_interface.h
++++ b/src/core/arm/arm_interface.h
+@@ -186,6 +186,12 @@ public:
+     /// Prepare core for thread reschedule (if needed to correctly handle state)
+     virtual void PrepareReschedule() = 0;
+ 
++    /// Called before the context of thread `thread_id` is loaded with LoadContext.
++    virtual void OnThreadSwitch(u32 thread_id) {}
++
++    /// Called when thread `thread_id` stops for good.
++    virtual void OnThreadExit(u32 thread_id) {}
++
+     /**
+      * Whether the backend allows to break with single instruction accuracy
+      * when Run() is used. If false is returned, the user should expect
+diff --git a/src/core/arm/external_cpu.h b/src/core/arm/external_cpu.h
+new file mode 100644
+index 000000000..a223f89f2
+--- /dev/null
++++ b/src/core/arm/external_cpu.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 PokemonSunNative contributors
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++// Hooks that let a frontend supply its own CPU backend (PokemonSunNative's ahead-of-time
++// translated code) and learn when code modules are loaded.
++
++#pragma once
++
++#include <functional>
++#include <memory>
++#include <string>
++#include "common/common_types.h"
++#include "core/core_timing.h"
++
++namespace Memory {
++class MemorySystem;
++}
++
++namespace Core {
++
++class ARM_Interface;
++class System;
++
++struct ExternalCpu {
++    /// When set, System::Init creates CPU cores with this instead of dynarmic / dyncom.
++    std::function<std::shared_ptr<ARM_Interface>(System&, Memory::MemorySystem&, u32 core_id,
++                                                 std::shared_ptr<Timing::Timer>)>
++        factory;
++    /// Called after ldr:ro has loaded and relocated a CRO module.
++    std::function<void(const std::string& name, VAddr address, u32 size)> on_cro_loaded;
++    /// Called before ldr:ro unloads a CRO module.
++    std::function<void(const std::string& name, VAddr address)> on_cro_unloaded;
++};
++
++ExternalCpu& GetExternalCpu();
++
++} // namespace Core
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index af0a71650..cae1155c0 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -22,6 +22,7 @@
+ #endif
+ #include "core/arm/dyncom/arm_dyncom.h"
+ #include "core/cheats/cheats.h"
++#include "core/arm/external_cpu.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
+ #include "core/dumping/backend.h"
+@@ -60,6 +61,11 @@
+ 
+ namespace Core {
+ 
++ExternalCpu& GetExternalCpu() {
++    static ExternalCpu external_cpu;
++    return external_cpu;
++}
++
+ /*static*/ System System::s_instance;
+ 
+ template <>
+@@ -544,7 +550,11 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
+ 
+     exclusive_monitor = MakeExclusiveMonitor(*memory, num_cores);
+     cpu_cores.reserve(num_cores);
+-    if (Settings::values.use_cpu_jit) {
++    if (GetExternalCpu().factory) {
++        for (u32 i = 0; i < num_cores; ++i) {
++            cpu_cores.push_back(GetExternalCpu().factory(*this, *memory, i, timing->GetTimer(i)));
++        }
++    } else if (Settings::values.use_cpu_jit) {
+ #if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
+         for (u32 i = 0; i < num_cores; ++i) {
+             cpu_cores.push_back(std::make_shared<ARM_Dynarmic>(
+diff --git a/src/core/hle/kernel/thread.cpp b/src/core/hle/kernel/thread.cpp
+index 03c9aa9be..b0cffbf7c 100644
+--- a/src/core/hle/kernel/thread.cpp
++++ b/src/core/hle/kernel/thread.cpp
+@@ -117,6 +117,9 @@ void Thread::Stop() {
+     }
+ 
+     status = ThreadStatus::Dead;
++    if (thread_manager.cpu) {
++        thread_manager.cpu->OnThreadExit(thread_id);
++    }
+ 
+     WakeupAllWaitingThreads();
+ 
+@@ -181,6 +184,7 @@ void ThreadManager::SwitchContext(Thread* new_thread) {
+             kernel.SetCurrentProcessForCPU(current_thread->owner_process.lock(), cpu->GetID());
+         }
+ 
++        cpu->OnThreadSwitch(new_thread->thread_id);
+         cpu->LoadContext(new_thread->context);
+         cpu->SetCP15Register(CP15_THREAD_URO, new_thread->GetTLSAddress());
+     } else {
+diff --git a/src/core/hle/service/ldr_ro/ldr_ro.cpp b/src/core/hle/service/ldr_ro/ldr_ro.cpp
+index 5fd3f36ba..ccc25601e 100644
+--- a/src/core/hle/service/ldr_ro/ldr_ro.cpp
++++ b/src/core/hle/service/ldr_ro/ldr_ro.cpp
+@@ -7,6 +7,7 @@
+ #include "common/common_types.h"
+ #include "common/logging/log.h"
+ #include "core/arm/arm_interface.h"
++#include "core/arm/external_cpu.h"
+ #include "core/core.h"
+ #include "core/hle/ipc_helpers.h"
+ #include "core/hle/kernel/process.h"
+@@ -327,6 +328,9 @@ void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
+ 
+     system.InvalidateCacheRange(cro_address, cro_size);
+ 
++    if (Core::GetExternalCpu().on_cro_loaded) {
++        Core::GetExternalCpu().on_cro_loaded(cro.ModuleName(), cro_address, cro_size);
++    }
+     LOG_INFO(Service_LDR, "CRO \"{}\" loaded at 0x{:08X}, fixed_end=0x{:08X}", cro.ModuleName(),
+              cro_address, cro_address + fix_size);
+ 
+@@ -367,6 +371,9 @@ void RO::UnloadCRO(Kernel::HLERequestContext& ctx) {
+     }
+ 
+     LOG_INFO(Service_LDR, "Unloading CRO \"{}\"", cro.ModuleName());
++    if (Core::GetExternalCpu().on_cro_unloaded) {
++        Core::GetExternalCpu().on_cro_unloaded(cro.ModuleName(), cro_address);
++    }
+ 
+     u32 fixed_size = cro.GetFixedSize();
+ 

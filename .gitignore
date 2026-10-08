@@ -1,0 +1,12 @@
+# Game data never goes in this repository
+*.3ds
+*.cci
+*.cxi
+*.cia
+*.7z
+*.zip
+/rom/
+# Build output (contains code translated from the game)
+/build/
+/gen/
+__pycache__/
