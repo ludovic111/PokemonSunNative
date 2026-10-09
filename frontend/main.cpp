@@ -124,7 +124,14 @@ int main(int argc, char** argv) {
     Common::Log::SetColorConsoleBackendEnabled(true);
 
     auto& system = Core::System::GetInstance();
-    recomp::InstallBackend();
+    // Developer A/B switch: run the original ARM code in Azahar's dynarmic instead of the
+    // translation, to tell translation bugs from everything else. Not for playing.
+    if (std::getenv("PSN_REFERENCE_CPU")) {
+        Settings::values.use_cpu_jit = true;
+        LOG_WARNING(Frontend, "PSN_REFERENCE_CPU set: using dynarmic, not the translated code");
+    } else {
+        recomp::InstallBackend();
+    }
     system.ApplySettings();
     Frontend::RegisterDefaultApplets(system);
 

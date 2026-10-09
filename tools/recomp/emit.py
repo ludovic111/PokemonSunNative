@@ -5,7 +5,11 @@ import os
 from . import arm
 
 
+WRITTEN = []
+
+
 def write_if_changed(path, text):
+    WRITTEN.append(path)
     try:
         with open(path) as fp:
             if fp.read() == text:
@@ -136,7 +140,7 @@ class FunctionWriter:
                 continue
             nk = next_key(insn)
             falls = not (insn.cond == 14 and insn.kind in ('b', 'jump', 'undef'))
-            if falls and (i + 1 >= len(keys) or keys[i + 1] != nk):
+            if falls and k not in f.falls and (i + 1 >= len(keys) or keys[i + 1] != nk):
                 labels.add(nk)
         for i, k in enumerate(keys):
             insn = f.insns[k]
@@ -160,7 +164,9 @@ class FunctionWriter:
             self.out += self.insn_code(k, insn)
             nk = next_key(insn)
             falls = not (insn.cond == 14 and insn.kind in ('b', 'jump', 'undef'))
-            if falls and (i + 1 >= len(keys) or keys[i + 1] != nk):
+            if k in f.falls:
+                self.w(f'    [[clang::musttail]] return {self.target_fn(f.falls[k])}(c);')
+            elif falls and (i + 1 >= len(keys) or keys[i + 1] != nk):
                 if nk in f.insns:
                     self.w(f'    goto {label(nk)};')
                 else:
@@ -214,7 +220,9 @@ def write_image(img, dec, entries, outdir, insns_per_file=40000, log=print):
         if count >= insns_per_file:
             flush()
     flush()
-    log(f'  {img.name}: {len(entries)} functions, {n} instructions, {len(files)} files')
+    cov = getattr(dec, 'coverage', 0) * 100
+    log(f'  {img.name}: {len(entries)} functions, {n} instructions, {cov:.1f}% of code covered, '
+        f'{len(files)} files')
     return files, all_labels
 
 

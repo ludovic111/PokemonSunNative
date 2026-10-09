@@ -136,6 +136,7 @@ class Function:
         self.tables = {}          # key of jump-table insn -> (reg, targets, is_load)
         self.calls = set()        # direct call targets
         self.tails = set()        # direct tail-call targets
+        self.falls = {}           # key of insn -> entry it falls through into (tail call)
 
 
 def explore(dec, key, entries, discover):
@@ -161,18 +162,26 @@ def explore(dec, key, entries, discover):
         f.insns[k] = insn
         nk = next_key(insn)
         kind = insn.kind
+
+        def follow(nxt):
+            # Straight-line flow into another function's entry becomes a tail call
+            if not discover and nxt in entries and nxt != key:
+                f.falls[k] = nxt
+            else:
+                work.append(nxt)
+
         if kind in ('op', 'svc', 'callr'):
-            work.append(nk)
+            follow(nk)
             if kind == 'callr':
                 f.labels.add(nk)
         elif kind == 'bl':
             f.calls.add(insn.target)
             f.labels.add(nk)
-            work.append(nk)
+            follow(nk)
         elif kind == 'b':
             t = insn.target
             if insn.cond != 14:
-                work.append(nk)
+                follow(nk)
             if not discover and t in entries and t != key:
                 f.tails.add(t)
             else:
@@ -186,7 +195,7 @@ def explore(dec, key, entries, discover):
                     f.labels.add(t)
                     work.append(t)
             if insn.cond != 14 or jt:
-                work.append(nk)
+                follow(nk)
                 f.labels.add(nk)
         elif kind == 'undef':
             pass
@@ -307,39 +316,98 @@ def plausible_entry(dec, key, limit=24):
 
 def discover(img, seeds, candidates=()):
     """Find all function entries in an image, starting from `seeds` (address | thumb, trusted)
-    and `candidates` (possible function pointers found in data, checked before use)."""
+    and `candidates` (possible function pointers found in data, checked before use).
+    Finally fills the gaps between known functions (code reached only through pointers that are
+    built at run time)."""
     dec = Decoder(img)
     entries = set()
+    covered = bytearray(max(e for _, e in img.code_ranges) - img.code_ranges[0][0])
+    origin = img.code_ranges[0][0]
+    pending = set(candidates)
     work = deque(s for s in seeds if dec.at(s) is not None)
-    work.extend(c for c in candidates if plausible_entry(dec, c))
-    candidates = set()
-    while work:
-        k = work.popleft()
-        if k in entries:
-            continue
-        entries.add(k)
-        f = explore(dec, k, entries, discover=True)
-        for t in f.calls:
-            if t not in entries and dec.at(t) is not None:
-                work.append(t)
-        for v in computed_pointers(img, f):
-            if img.in_code(v & ~1, 2) and (v & 3) in (0, 1, 3):
-                candidates.add(v if (v & 1) or not (v & 2) else v)
-        for insn in f.insns.values():
-            if insn is None or insn.literal is None:
+
+    def mark(a, n):
+        o = a - origin
+        if 0 <= o < len(covered):
+            covered[o:o + n] = b'\x01' * min(n, len(covered) - o)
+
+    def run():
+        while work or pending:
+            for cand in list(pending):
+                pending.discard(cand)
+                if cand not in entries and plausible_entry(dec, cand):
+                    work.append(cand)
+            if not work:
+                break
+            k = work.popleft()
+            if k in entries:
                 continue
-            lit = insn.literal
-            # Function pointers loaded from literal pools
-            if img.module_relative:
-                rel = img.relocs.get(lit)
-                if rel and rel[0] == img.name and rel[2] == 0:
-                    candidates.add(rel[1])
-            elif img.in_code(lit, 4) or img.is_const(lit, 4):
-                v = img.read32(lit)
+            entries.add(k)
+            f = explore(dec, k, entries, discover=True)
+            for t in f.calls:
+                if t not in entries and dec.at(t) is not None:
+                    work.append(t)
+            for v in computed_pointers(img, f):
                 if img.in_code(v & ~1, 2):
-                    candidates.add(v)
-        for c in list(candidates):
-            candidates.discard(c)
-            if c not in entries and plausible_entry(dec, c):
-                work.append(c)
+                    pending.add(v)
+            for key, insn in f.insns.items():
+                if insn is None:
+                    continue
+                mark(insn.addr, insn.size)
+                if key in f.tables and f.tables[key][2]:
+                    mark(insn.addr + 8, 4 * len(f.tables[key][1]))
+                if insn.literal is None:
+                    continue
+                lit = insn.literal
+                mark(lit, 8 if insn.text in ('vldr', 'ldrd') else 4)
+                # Function pointers loaded from literal pools
+                if img.module_relative:
+                    rel = img.relocs.get(lit)
+                    if rel and rel[0] == img.name and rel[2] == 0:
+                        pending.add(rel[1])
+                elif img.in_code(lit, 4) or img.is_const(lit, 4):
+                    v = img.read32(lit)
+                    if img.in_code(v & ~1, 2):
+                        pending.add(v)
+
+    run()
+    # Gap filling: code nobody references statically (e.g. pointers in tables built at run time)
+    for _ in range(10000):
+        added = 0
+        for s, e in img.code_ranges:
+            a = s
+            while a < e:
+                if covered[a - origin]:
+                    a += 2
+                    continue
+                g = a
+                while g < e and not covered[g - origin]:
+                    g += 2
+                gap_start, gap_end = a, g
+                a = g
+                # Find the first address in the gap that starts plausible code (gaps may begin
+                # with padding or data such as literal pools of the previous function)
+                p = (gap_start + 3) & ~3
+                prev_thumb = gap_start >= origin + 2 and dec.cache.get((gap_start - 2) | 1) is not None
+                tries = 0
+                while p + 4 <= gap_end and tries < 64:
+                    if img.read32(p) in (0, 0xE1A00000, 0xE320F000):
+                        p += 4
+                        continue
+                    found = None
+                    for key in ((p | 1, p) if prev_thumb else (p, p | 1)):
+                        if key not in entries and plausible_entry(dec, key, limit=48):
+                            found = key
+                            break
+                    if found is not None:
+                        work.append(found)
+                        added += 1
+                        break
+                    p += 4
+                    tries += 1
+        if not added:
+            break
+        run()
+    total = sum(e - s for s, e in img.code_ranges)
+    dec.coverage = sum(covered) / max(total, 1)
     return dec, entries

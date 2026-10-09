@@ -113,6 +113,11 @@ def main(argv=None):
         _, labels = emit.write_image(img, dec, entries, args.outdir, log=log)
         results.append((entries, labels))
     emit.write_tables(images, results, args.outdir)
+    # Remove files left over from an earlier run that produced more of them
+    written = {os.path.basename(p) for p in emit.WRITTEN}
+    for name in os.listdir(args.outdir):
+        if name.endswith('.cpp') and name not in written:
+            os.remove(os.path.join(args.outdir, name))
     log(f'done in {time.time() - t0:.1f}s')
 
 
