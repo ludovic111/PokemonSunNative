@@ -2,7 +2,9 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -106,5 +108,9 @@ void ModuleUnloaded(const std::string& name, u32 address);
 
 /// Install the backend factory and module hooks into Azahar.
 void InstallBackend();
+
+/// Called with a description before the program stops on an unrecoverable error (e.g. to show
+/// a message box).
+void SetFatalHandler(std::function<void(const std::string&)> handler);
 
 } // namespace recomp

@@ -33,6 +33,7 @@ struct LoadedModule {
 };
 
 std::vector<LoadedModule> loaded_modules;
+std::function<void(const std::string&)> fatal_handler;
 
 struct CacheSlot {
     u32 key;
@@ -89,6 +90,8 @@ std::string Where(u32 target) {
         LOG_CRITICAL(Core_ARM11, "module {} at {:08X}", m.image->name, m.base);
     }
     Common::Log::Stop();
+    if (fatal_handler)
+        fatal_handler(what);
     std::abort();
 }
 
@@ -394,6 +397,10 @@ void ARM_Recomp::FiberMain(Fiber* fiber) {
         Fatal(c, fmt::format("thread reached {:08X} ({}): no translated code there", target,
                              Where(target)));
     }
+}
+
+void SetFatalHandler(std::function<void(const std::string&)> handler) {
+    fatal_handler = std::move(handler);
 }
 
 void InstallBackend() {

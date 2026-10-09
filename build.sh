@@ -103,6 +103,14 @@ if [ ! -f "$BUILD/azahar/CMakeCache.txt" ]; then
     -DPSN_SOURCE_DIR="$ROOT" -DPSN_GEN_DIR="$BUILD/gen" ${PSN_CMAKE_ARGS:-}
 fi
 
+sdl_config=$(find "$BUILD/azahar/externals/sdl2" -name SDL_config.h -path '*include-config*' 2>/dev/null | head -1)
+if [ -n "$sdl_config" ] && ! grep -qE 'define SDL_VIDEO_DRIVER_(X11|WAYLAND) 1' "$sdl_config"; then
+  rm -rf "$BUILD/azahar"
+  die "SDL found neither X11 nor Wayland development files, so the game could not open a window.
+  Ubuntu / Debian: sudo apt install libx11-dev libxext-dev libwayland-dev libxkbcommon-dev libegl-dev
+  then run ./build.sh again."
+fi
+
 say "Compiling with $JOBS jobs (first build: a few minutes on a fast CPU, longer otherwise)"
 cmake --build "$BUILD/azahar" --target pokemon-sun -j "$JOBS"
 EXE=$(find "$BUILD/azahar/bin" -name pokemon-sun -type f -perm -u+x | head -1)

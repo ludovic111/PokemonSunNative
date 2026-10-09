@@ -102,18 +102,24 @@ void ApplySettings() {
 int main(int argc, char** argv) {
     std::string rom;
     bool fullscreen = true;
+    bool pause_in_background = true;
+    const char* usage = "usage: %s [--windowed] [--keep-running] GAME.3ds\n"
+                        "  --windowed      start in a window instead of fullscreen\n"
+                        "  --keep-running  keep playing while the window is in the background\n";
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--windowed" || a == "-w")
             fullscreen = false;
+        else if (a == "--keep-running")
+            pause_in_background = false;
         else if (a == "--help" || a == "-h") {
-            std::printf("usage: %s [--windowed] GAME.3ds\n", argv[0]);
+            std::printf(usage, argv[0]);
             return 0;
         } else
             rom = a;
     }
     if (rom.empty()) {
-        std::fprintf(stderr, "usage: %s [--windowed] GAME.3ds\n", argv[0]);
+        std::fprintf(stderr, usage, argv[0]);
         return 1;
     }
 
@@ -134,6 +140,14 @@ int main(int argc, char** argv) {
         LOG_WARNING(Frontend, "PSN_REFERENCE_CPU set: using dynarmic, not the translated code");
     } else {
         recomp::InstallBackend();
+        recomp::SetFatalHandler([data_dir](const std::string& what) {
+            const std::string msg = fmt::format(
+                "The game stopped: {}\n\nPlease report this at "
+                "https://github.com/ludovic111/PokemonSunNative/issues with the lines marked "
+                "\"Critical\" in\n{}log/azahar_log.txt\n\nYour last in-game save is safe.",
+                what, data_dir);
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Pokémon Sun", msg.c_str(), nullptr);
+        });
     }
     system.ApplySettings();
     Frontend::RegisterDefaultApplets(system);
@@ -166,7 +180,7 @@ int main(int argc, char** argv) {
 
     u32 last_stats = SDL_GetTicks();
     while (window->IsOpen()) {
-        if (!window->IsFocused()) {
+        if (pause_in_background && !window->IsFocused()) {
             // Paused in the background: keep the window responsive, use no CPU
             window->PollEvents();
             SDL_Delay(20);

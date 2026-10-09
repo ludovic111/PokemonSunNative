@@ -70,7 +70,7 @@ The game starts in borderless fullscreen. Use `pokemon-sun --windowed` for a win
 | Fullscreen | `F11` or `Alt+Enter` | |
 | Walk slowly (half tilt) | hold `Caps Lock` | |
 
-The game pauses while its window is in the background. The cursor hides after 3 seconds without
+The game pauses while its window is in the background (`--keep-running` turns that off). The cursor hides after 3 seconds without
 movement.
 
 ## Saves
