@@ -1,6 +1,7 @@
 [submodule "external/azahar"]
 	path = external/azahar
 	url = https://github.com/azahar-emu/azahar
+	ignore = dirty
 [submodule "external/imgui"]
 	path = external/imgui
 	url = https://github.com/ocornut/imgui
