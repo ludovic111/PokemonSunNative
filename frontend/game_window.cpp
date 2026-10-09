@@ -114,6 +114,14 @@ void GameWindow::UpdatePerformanceInfo(double fps, double speed) {
     (void)speed;
 }
 
+int GameWindow::RefreshRate() const {
+    SDL_DisplayMode mode;
+    const int display = SDL_GetWindowDisplayIndex(window);
+    if (display >= 0 && SDL_GetCurrentDisplayMode(display, &mode) == 0)
+        return mode.refresh_rate;
+    return 0;
+}
+
 void GameWindow::OnResize() {
     int w, h;
     SDL_Vulkan_GetDrawableSize(window, &w, &h);

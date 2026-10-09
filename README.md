@@ -51,7 +51,31 @@ million translated instructions. That takes about 4 minutes on a 24-thread CPU a
 longer on smaller ones. It installs `~/.local/bin/pokemon-sun` and a desktop entry. Run it again
 after `git pull` to rebuild.
 
-The game starts in borderless fullscreen. Use `pokemon-sun --windowed` for a window.
+The game starts in borderless fullscreen at your monitor's refresh rate (see
+[Frame rate](#frame-rate)). Use `pokemon-sun --windowed` for a window, `--mute` for no sound.
+
+## Frame rate
+
+Pokémon Sun runs its game logic at 30 FPS. PokemonSunNative shows as many frames per second as
+you want: by default your monitor's refresh rate (60, 120, 144, 165, 240…), or any number you
+choose:
+
+```sh
+pokemon-sun --fps 144      # any rate from 10 to 1000
+pokemon-sun --fps native   # the game's own 30 FPS
+```
+
+The extra frames are not guessed from pictures. Every 3D object is drawn again, blended between
+the game's last two frames: each draw's transform matrices (camera, characters, every animated
+bone) are interpolated, the same technique the N64 recompilations use. The game's speed, logic and
+timing don't change. The cost is that what you see trails the game by up to one of its frames
+(33 ms). Each extra frame takes about 1.5 ms of CPU, so a few hundred FPS is fine on a recent
+processor. With a rate above your monitor's refresh rate, vsync is turned off.
+
+Not blended: 2D menus and text (they don't move between frames anyway), and anything the game
+rebuilds from scratch every frame, such as some particle effects. Camera cuts are detected and
+not blended. In-game photos (Poké Finder) may capture the slightly older frame; use
+`--fps native` if that matters to you.
 
 ## Controls
 
@@ -103,6 +127,10 @@ your .3ds ──► tools/recomp ──► build/gen/*.cpp ──► clang ─�
   come from Azahar's ARM11 timing table. Code modules (`Battle.cro`, `FieldRo.cro`, …) are
   matched by name when the game loads them, wherever in memory it puts them.
 - **frontend/** is a small SDL2 + Vulkan window built for keyboard and mouse.
+- **Frame interpolation** (`video_core/frame_interpolator.cpp`, added to Azahar by the patch)
+  records each game frame's GPU work (command lists with the vertex data they read, clears,
+  copies) instead of drawing it right away. At every display refresh it replays the latest frame
+  with each draw's vertex-shader uniforms blended against the matching draw of the frame before.
 - **tests/fuzz** checks the translator against dynarmic, Azahar's ARM JIT. Random ARM, Thumb
   and VFP instructions run on both, and registers, flags and memory are compared
   (`tests/fuzz/run.sh`, after a build).

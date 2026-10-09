@@ -45,6 +45,8 @@ public:
     void SetIcon(const std::vector<u16>& rgb565, int size);
     void SetTitle(const std::string& title);
     void UpdatePerformanceInfo(double fps, double speed);
+    /// Refresh rate of the monitor the window is on, in Hz (0 if unknown).
+    int RefreshRate() const;
 
 private:
     void OnKey(int scancode, bool pressed, bool repeat, u16 mods);

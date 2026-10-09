@@ -15,6 +15,7 @@
 #include <SDL.h>
 
 #include "arm_recomp.h"
+#include "audio_core/sink_details.h"
 #include "common/common_paths.h"
 #include "common/file_util.h"
 #include "common/logging/backend.h"
@@ -29,6 +30,7 @@
 #include "game_window.h"
 #include "input_common/main.h"
 #include "network/network.h"
+#include "video_core/frame_interpolator.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 
@@ -103,18 +105,37 @@ int main(int argc, char** argv) {
     std::string rom;
     bool fullscreen = true;
     bool pause_in_background = true;
-    const char* usage = "usage: %s [--windowed] [--keep-running] [--speed PERCENT] GAME.3ds\n"
-                        "  --windowed      start in a window instead of fullscreen\n"
-                        "  --keep-running  keep playing while the window is in the background\n"
-                        "  --speed PERCENT game speed (100 = normal)\n";
+    double fps = -1.0; // -1: the monitor's refresh rate
+    const char* usage =
+        "usage: %s [--fps N|native] [--windowed] [--keep-running] [--speed PERCENT] GAME.3ds\n"
+        "  --fps N         frames per second to display (default: your monitor's refresh rate).\n"
+        "                  The game runs at its normal speed; frames in between are interpolated.\n"
+        "  --fps native    the game's own 30 FPS, without interpolation\n"
+        "  --windowed      start in a window instead of fullscreen\n"
+        "  --keep-running  keep playing while the window is in the background\n"
+        "  --mute          no sound\n"
+        "  --speed PERCENT game speed (100 = normal)\n";
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--windowed" || a == "-w")
             fullscreen = false;
         else if (a == "--keep-running")
             pause_in_background = false;
+        else if (a == "--mute")
+            Settings::values.output_type = AudioCore::SinkType::Null;
         else if (a == "--speed" && i + 1 < argc)
             Settings::values.frame_limit = std::atof(argv[++i]);
+        else if (a == "--fps" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            fps = (v == "native" || v == "0") ? 0.0 : std::atof(v.c_str());
+            if (fps < 0.0 || (fps > 0.0 && fps < 10.0) || fps > 1000.0) {
+                std::fprintf(stderr, "--fps: expected a number from 10 to 1000, or native\n");
+                return 1;
+            }
+        } else if (a.rfind("--fps=", 0) == 0) {
+            const std::string v = a.substr(6);
+            fps = (v == "native" || v == "0") ? 0.0 : std::atof(v.c_str());
+        }
         else if (a == "--help" || a == "-h") {
             std::printf(usage, argv[0]);
             return 0;
@@ -159,6 +180,18 @@ int main(int argc, char** argv) {
     auto window = std::make_unique<GameWindow>(system, fullscreen);
     const auto scope = window->Acquire();
 
+    // Display rate: interpolate the game's frames up to the monitor's refresh rate (or --fps)
+    const int refresh = window->RefreshRate();
+    if (fps < 0.0)
+        fps = refresh > 0 ? refresh : 60.0;
+    if (fps > 0.0) {
+        VideoCore::SetDisplayRate(fps);
+        // Sync to the display when showing one frame per refresh; above that, don't wait for it
+        Settings::values.use_vsync = refresh <= 0 || fps <= refresh + 1;
+    }
+    LOG_INFO(Frontend, "Display: {} Hz monitor, showing {}", refresh,
+             fps > 0.0 ? fmt::format("{:g} FPS (interpolated)", fps) : "the game's own frames");
+
     const auto result = system.Load(*window, rom);
     if (result != Core::System::ResultStatus::Success) {
         LOG_CRITICAL(Frontend, "Could not start the game ({}): {}", static_cast<int>(result),
@@ -197,7 +230,8 @@ int main(int argc, char** argv) {
                       system.GetStatusDetails());
         if (SDL_GetTicks() - last_stats > 1000) {
             const auto stats = system.GetAndResetPerfStats();
-            window->UpdatePerformanceInfo(stats.game_fps, stats.emulation_speed);
+            window->UpdatePerformanceInfo(fps > 0.0 ? stats.system_fps : stats.game_fps,
+                                          stats.emulation_speed);
             last_stats = SDL_GetTicks();
         }
     }

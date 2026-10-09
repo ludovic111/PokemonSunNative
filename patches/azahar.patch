@@ -188,3 +188,986 @@ index 5fd3f36ba..ccc25601e 100644
  
      u32 fixed_size = cro.GetFixedSize();
  
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 528072c9a..b03a1d6f6 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -9,6 +9,8 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
+     custom_textures/material.h
+     debug_utils/debug_utils.cpp
+     debug_utils/debug_utils.h
++    frame_interpolator.cpp
++    frame_interpolator.h
+     gpu.cpp
+     gpu.h
+     gpu_debugger.h
+diff --git a/src/video_core/frame_interpolator.cpp b/src/video_core/frame_interpolator.cpp
+new file mode 100644
+index 000000000..89ee671f6
+--- /dev/null
++++ b/src/video_core/frame_interpolator.cpp
+@@ -0,0 +1,435 @@
++// Copyright 2026 PokemonSunNative contributors
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++
++#include "common/logging/log.h"
++#include "core/memory.h"
++#include "video_core/frame_interpolator.h"
++#include "video_core/gpu.h"
++#include "video_core/pica/pica_core.h"
++#include "video_core/rasterizer_interface.h"
++#include "video_core/renderer_base.h"
++
++namespace VideoCore {
++
++namespace {
++
++double display_rate = 0.0;
++
++// Frames further apart than this (in emulated time) are not blended: the game was loading or
++// paused, and the two frames are unrelated.
++constexpr u64 MAX_BLEND_GAP = 4 * FRAME_TICKS;
++
++u64 Mix(u64 h, u64 v) {
++    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
++    return h;
++}
++
++/// Whether a uniform component changing from `a` to `b` between two game frames should be
++/// blended. Vertex-shader uniforms are mostly 3x4 matrices stored as rows: x, y, z hold rotation
++/// and scale, w holds translation, which can legitimately move a lot in one frame. Whole numbers
++/// that change (counters, indices) switch over instead of being blended.
++bool Blendable(float a, float b, u32 component) {
++    if (!std::isfinite(a) || !std::isfinite(b))
++        return false;
++    const float magnitude = std::max(std::fabs(a), std::fabs(b));
++    if (a == std::floor(a) && b == std::floor(b) && magnitude < 1024.0f)
++        return false;
++    const float limit = component == 3 ? 4.0f + magnitude : 0.75f + 0.35f * magnitude;
++    return std::fabs(a - b) <= limit;
++}
++
++/// A rotation-like component (|value| <= ~1) jumped: the object or the camera turned too far in
++/// one frame to be motion (a cut).
++bool RotationJump(float a, float b, u32 component) {
++    return component != 3 && std::max(std::fabs(a), std::fabs(b)) <= 1.5f &&
++           std::fabs(a - b) > 0.75f;
++}
++
++} // namespace
++
++void SetDisplayRate(double fps) {
++    display_rate = fps;
++}
++
++double GetDisplayRate() {
++    return display_rate;
++}
++
++void FrameInterpolator::Frame::Clear() {
++    start_state.clear();
++    ops.clear();
++    draws.clear();
++    ranges.clear();
++    segments.clear();
++    blob.clear();
++    transfer_outputs.clear();
++    end_ticks = 0;
++    started = false;
++}
++
++FrameInterpolator::FrameInterpolator(Pica::PicaCore& pica_, Memory::MemorySystem& memory_)
++    : pica{pica_}, memory{memory_} {}
++
++FrameInterpolator::~FrameInterpolator() = default;
++
++u32 FrameInterpolator::AddBlob(const u8* data, u32 size) {
++    const u32 offset = static_cast<u32>(recording.blob.size());
++    recording.blob.insert(recording.blob.end(), data, data + size);
++    return offset;
++}
++
++void FrameInterpolator::BeginFrameIfNeeded() {
++    if (recording.started)
++        return;
++    recording.started = true;
++    recording.start_state = pica.SaveState();
++}
++
++void FrameInterpolator::RecordFill(u32 index, const Pica::MemoryFillConfig& config) {
++    BeginFrameIfNeeded();
++    Op op{Op::Type::Fill, index, 0, 0, {}};
++    std::memcpy(op.config.data(), &config, sizeof(config));
++    recording.ops.push_back(op);
++}
++
++void FrameInterpolator::RecordTransfer(const Pica::DisplayTransferConfig& config) {
++    BeginFrameIfNeeded();
++    Op op{Op::Type::Transfer, 0, 0, 0, {}};
++    std::memcpy(op.config.data(), &config, sizeof(config));
++    recording.ops.push_back(op);
++    if (!config.is_texture_copy)
++        recording.transfer_outputs.push_back(config.GetPhysicalOutputAddress());
++}
++
++void FrameInterpolator::RecordCmdList(PAddr addr, u32 size) {
++    BeginFrameIfNeeded();
++    recording.ops.push_back(Op{Op::Type::CmdList, 0, addr, size, {}});
++}
++
++void FrameInterpolator::RecordWords(PAddr addr, const u8* data, u32 size) {
++    if (!data)
++        return;
++    recording.segments.push_back(Segment{addr, size, AddBlob(data, size)});
++}
++
++void FrameInterpolator::RecordDraw(bool is_indexed) {
++    const auto& regs = pica.regs.internal;
++    const auto& pipeline = regs.pipeline;
++    const PAddr base = pipeline.vertex_attributes.GetPhysicalBaseAddress();
++
++    Draw draw{};
++    draw.first_range = static_cast<u32>(recording.ranges.size());
++
++    auto snapshot = [&](PAddr addr, u32 size) {
++        const u8* p = memory.GetPhysicalPointer(addr);
++        if (!p || size == 0 || size > 16 * 1024 * 1024)
++            return;
++        recording.ranges.push_back(Range{addr, size, AddBlob(p, size)});
++    };
++
++    u32 vmin, vmax;
++    if (is_indexed) {
++        const PAddr index_addr = base + pipeline.index_array.offset;
++        const bool u16_indices = pipeline.index_array.format != 0;
++        const u32 count = pipeline.num_vertices;
++        const u8* p = memory.GetPhysicalPointer(index_addr);
++        if (!p || count == 0) {
++            vmin = vmax = 0;
++        } else {
++            vmin = 0xFFFF;
++            vmax = 0;
++            for (u32 i = 0; i < count; i++) {
++                u32 v;
++                if (u16_indices) {
++                    u16 x;
++                    std::memcpy(&x, p + 2 * i, 2);
++                    v = x;
++                } else {
++                    v = p[i];
++                }
++                vmin = std::min(vmin, v);
++                vmax = std::max(vmax, v);
++            }
++            snapshot(index_addr, count * (u16_indices ? 2 : 1));
++        }
++    } else {
++        vmin = pipeline.vertex_offset;
++        vmax = pipeline.vertex_offset + std::max<u32>(pipeline.num_vertices, 1) - 1;
++    }
++
++    u64 key = Mix(0, base);
++    key = Mix(key, is_indexed ? pipeline.index_array.offset : pipeline.vertex_offset);
++    key = Mix(key, pipeline.num_vertices);
++    key = Mix(key, regs.vs.main_offset);
++    key = Mix(key, regs.texturing.texture0.address);
++    key = Mix(key, regs.framebuffer.framebuffer.color_buffer_address);
++    for (const auto& loader : pipeline.vertex_attributes.attribute_loaders) {
++        if (loader.component_count == 0)
++            continue;
++        key = Mix(key, loader.data_offset);
++        const u32 stride = loader.byte_count;
++        if (vmax >= vmin && stride != 0)
++            snapshot(base + loader.data_offset + vmin * stride, (vmax - vmin + 1) * stride);
++    }
++    draw.key = key;
++    draw.f = pica.vs_setup.uniforms.f;
++    draw.num_ranges = static_cast<u32>(recording.ranges.size()) - draw.first_range;
++    recording.draws.push_back(draw);
++}
++
++void FrameInterpolator::EndFrame(u64 ticks) {
++    if (!recording.started)
++        return;
++    // Debugging aid: PSN_INTERP_FREEZE=<file> keeps the current pair of frames while the file
++    // exists, and PSN_INTERP_T=<t> forces the blend factor.
++    if (const char* freeze = std::getenv("PSN_INTERP_FREEZE"); freeze && frames[0].serial) {
++        if (std::FILE* fp = std::fopen(freeze, "r")) {
++            std::fclose(fp);
++            recording.Clear();
++            return;
++        }
++    }
++    recording.end_ticks = ticks;
++    recording.framebuffer_config = {pica.regs.framebuffer_config[0],
++                                    pica.regs.framebuffer_config[1]};
++    recording.regs_lcd = pica.regs_lcd;
++    recording.serial = next_serial++;
++    std::swap(frames[0], frames[1]);
++    std::swap(frames[1], recording);
++    recording.Clear();
++    MatchFrames();
++}
++
++void FrameInterpolator::MatchFrames() {
++    const Frame& prev = frames[0];
++    const Frame& cur = frames[1];
++    match.assign(cur.draws.size(), -1);
++    blend.assign(cur.draws.size(), Blend::Same);
++    cut = false;
++    if (!prev.serial || cur.end_ticks <= prev.end_ticks ||
++        cur.end_ticks - prev.end_ticks > MAX_BLEND_GAP) {
++        return;
++    }
++
++    // The k-th draw with a given key in this frame matches the k-th one in the previous frame
++    std::unordered_map<u64, std::vector<u32>> by_key;
++    for (u32 i = 0; i < prev.draws.size(); i++)
++        by_key[prev.draws[i].key].push_back(i);
++    std::unordered_map<u64, u32> used;
++
++    u32 moving = 0, turned = 0;
++    for (u32 i = 0; i < cur.draws.size(); i++) {
++        const Draw& d = cur.draws[i];
++        auto it = by_key.find(d.key);
++        if (it == by_key.end())
++            continue;
++        u32& n = used[d.key];
++        if (n >= it->second.size())
++            continue;
++        const Draw& p = prev.draws[it->second[n++]];
++        match[i] = static_cast<s32>(&p - prev.draws.data());
++        bool same = true, jumped = false;
++        for (u32 r = 0; r < 96; r++) {
++            for (u32 c = 0; c < 4; c++) {
++                const float a = p.f[r][c].ToFloat32(), b = d.f[r][c].ToFloat32();
++                if (a == b)
++                    continue;
++                same = false;
++                jumped |= RotationJump(a, b, c);
++            }
++        }
++        if (same)
++            continue;
++        blend[i] = Blend::Lerp;
++        moving++;
++        turned += jumped;
++    }
++    // Most moving things jumped at once: a camera cut or a scene change, don't blend anything
++    cut = moving >= 4 && turned * 2 > moving;
++}
++
++const u8* FrameInterpolator::ReplayWords(PAddr addr, u32 size) {
++    // Segments are consumed in the order the game's lists were read
++    if (!replaying || replay_segment >= replaying->segments.size())
++        return nullptr;
++    const Segment& s = replaying->segments[replay_segment];
++    if (s.addr != addr || s.size != size)
++        return nullptr;
++    replay_segment++;
++    return replaying->blob.data() + s.blob_offset;
++}
++
++void FrameInterpolator::BeginReplayDraw() {
++    if (!replaying || replay_draw >= replaying->draws.size())
++        return;
++    const u32 index = replay_draw;
++    const Draw& d = replaying->draws[index];
++
++    // Put the vertex and index data back as they were when the game drew this
++    for (u32 r = d.first_range; r < d.first_range + d.num_ranges; r++) {
++        const Range& range = replaying->ranges[r];
++        u8* live = memory.GetPhysicalPointer(range.addr);
++        const u8* recorded = replaying->blob.data() + range.blob_offset;
++        if (!live || std::memcmp(live, recorded, range.size) == 0)
++            continue;
++        overlay.emplace_back(live, std::vector<u8>(live, live + range.size));
++        std::memcpy(live, recorded, range.size);
++    }
++
++    // Blend the uniforms (matrices) with the matching draw of the previous frame
++    if (replaying == &frames[1] && !cut && replay_t < 1.0f && index < match.size() &&
++        match[index] >= 0 && blend[index] == Blend::Lerp) {
++        const Draw& p = frames[0].draws[match[index]];
++        auto& f = pica.vs_setup.uniforms.f;
++        saved_uniforms = f;
++        const float t = replay_t;
++        for (u32 r = 0; r < 96; r++) {
++            for (u32 c = 0; c < 4; c++) {
++                const float a = p.f[r][c].ToFloat32(), b = d.f[r][c].ToFloat32();
++                if (a != b && Blendable(a, b, c))
++                    f[r][c] = Pica::f24::FromFloat32(a + (b - a) * t);
++            }
++        }
++        pica.vs_setup.uniforms_dirty = true;
++        uniforms_overridden = true;
++    }
++}
++
++void FrameInterpolator::EndReplayDraw() {
++    if (!replaying)
++        return;
++    for (auto it = overlay.rbegin(); it != overlay.rend(); ++it)
++        std::memcpy(it->first, it->second.data(), it->second.size());
++    overlay.clear();
++    if (uniforms_overridden) {
++        pica.vs_setup.uniforms.f = saved_uniforms;
++        pica.vs_setup.uniforms_dirty = true;
++        uniforms_overridden = false;
++    }
++    replay_draw++;
++}
++
++void FrameInterpolator::Replay(const Frame& frame, float t, RasterizerInterface& rasterizer) {
++    replaying = &frame;
++    replay_t = t;
++    replay_draw = 0;
++    replay_segment = 0;
++    pica.LoadState(frame.start_state);
++    pica.SetReplayMode(this);
++    for (const Op& op : frame.ops) {
++        switch (op.type) {
++        case Op::Type::Fill: {
++            auto& config = pica.regs.memory_fill_config[op.index];
++            std::memcpy(&config, op.config.data(), sizeof(config));
++            if (config.trigger) {
++                const bool ok = rasterizer.AccelerateFill(config);
++                if (std::getenv("PSN_INTERP_DEBUG") && (debug_counter % 60) == 1)
++                    LOG_INFO(HW_GPU, "replay fill {:08X}-{:08X} ok {}", config.GetStartAddress(),
++                             config.GetEndAddress(), ok);
++            }
++            config.trigger.Assign(0);
++            config.finished.Assign(1);
++            break;
++        }
++        case Op::Type::Transfer: {
++            auto& config = pica.regs.display_transfer_config;
++            std::memcpy(&config, op.config.data(), sizeof(config));
++            bool ok;
++            if (config.is_texture_copy)
++                ok = rasterizer.AccelerateTextureCopy(config);
++            else
++                ok = rasterizer.AccelerateDisplayTransfer(config);
++            if (std::getenv("PSN_INTERP_DEBUG") && (debug_counter % 60) == 1)
++                LOG_INFO(HW_GPU, "replay transfer {:08X} -> {:08X} ok {}",
++                         config.GetPhysicalInputAddress(), config.GetPhysicalOutputAddress(), ok);
++            config.trigger.Assign(0);
++            break;
++        }
++        case Op::Type::CmdList:
++            pica.ProcessCmdList(op.addr, op.size, false);
++            break;
++        }
++    }
++    pica.SetReplayMode(nullptr);
++    if (std::getenv("PSN_INTERP_DEBUG") && (debug_counter % 60) == 1)
++        LOG_INFO(HW_GPU, "replay: {} of {} draws, {} of {} segments", replay_draw,
++                 frame.draws.size(), replay_segment, frame.segments.size());
++    replaying = nullptr;
++}
++
++void FrameInterpolator::Present(u64 now_ticks, RasterizerInterface& rasterizer,
++                                RendererBase& renderer) {
++    const Frame& cur = frames[1];
++    if (!cur.serial) {
++        renderer.SwapBuffers();
++        return;
++    }
++
++    float t = 1.0f;
++    const Frame& prev = frames[0];
++    if (prev.serial && cur.end_ticks > prev.end_ticks &&
++        cur.end_ticks - prev.end_ticks <= MAX_BLEND_GAP && !cut) {
++        const double span = static_cast<double>(cur.end_ticks - prev.end_ticks);
++        const double since = now_ticks > cur.end_ticks
++                                 ? static_cast<double>(now_ticks - cur.end_ticks)
++                                 : 0.0;
++        t = static_cast<float>(std::clamp(since / span, 0.0, 1.0));
++    }
++
++    if (std::getenv("PSN_INTERP_DEBUG") && (debug_counter++ % 60) == 0) {
++        u32 matched = 0, lerp = 0;
++        for (u32 i = 0; i < match.size(); i++) {
++            matched += match[i] >= 0;
++            lerp += blend[i] == Blend::Lerp;
++        }
++        LOG_INFO(HW_GPU,
++                 "interp: frame {} draws {} matched {} blended {} t {:.2f} cut {} blob {} KB, "
++                 "replay {} us",
++                 cur.serial, cur.draws.size(), matched, lerp, t, cut, cur.blob.size() / 1024,
++                 replays ? replay_us / replays : 0);
++        replay_us = replays = 0;
++    }
++    if (const char* forced = std::getenv("PSN_INTERP_T")) {
++        if (std::FILE* fp = std::fopen(forced, "r")) {
++            float v = 1.0f;
++            if (std::fscanf(fp, "%f", &v) == 1)
++                t = std::clamp(v, 0.0f, 1.0f);
++            std::fclose(fp);
++        }
++    }
++    const std::string live = pica.SaveState();
++    if (cur.serial != last_serial || t != last_t) {
++        const auto start = std::chrono::steady_clock::now();
++        Replay(cur, t, rasterizer);
++        replay_us += std::chrono::duration_cast<std::chrono::microseconds>(
++                         std::chrono::steady_clock::now() - start)
++                         .count();
++        replays++;
++        last_serial = cur.serial;
++        last_t = t;
++    }
++
++    // Show the screens this frame wrote, whatever the game has swapped to since
++    pica.regs_lcd = cur.regs_lcd;
++    for (u32 screen = 0; screen < 2; screen++) {
++        auto fb = cur.framebuffer_config[screen];
++        for (const PAddr out : cur.transfer_outputs) {
++            if (out == fb.address_left1)
++                fb.active_fb = 0;
++            else if (out == fb.address_left2)
++                fb.active_fb = 1;
++        }
++        pica.regs.framebuffer_config[screen] = fb;
++    }
++    renderer.SwapBuffers();
++    pica.LoadState(live);
++}
++
++} // namespace VideoCore
+diff --git a/src/video_core/frame_interpolator.h b/src/video_core/frame_interpolator.h
+new file mode 100644
+index 000000000..aeada797e
+--- /dev/null
++++ b/src/video_core/frame_interpolator.h
+@@ -0,0 +1,147 @@
++// Copyright 2026 PokemonSunNative contributors
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++// Display-rate frame interpolation.
++//
++// Games render at a fixed rate (Pokémon Sun: 30 FPS). In interpolation mode the GPU work of each
++// game frame is recorded instead of being executed: command lists (with the vertex and index data
++// they read), memory fills and display transfers. At every display refresh the last complete frame
++// is replayed through the rasterizer, with each draw's vertex-shader uniforms (its matrices)
++// blended between that frame and the one before it. Draws are matched between frames by what they
++// draw (vertex buffers, shader, texture, render target). The game's logic and timing are untouched;
++// what is shown lags the game by at most one of its frames.
++
++#pragma once
++
++#include <array>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include "common/common_types.h"
++#include "common/vector_math.h"
++#include "video_core/pica/regs_external.h"
++#include "video_core/pica/regs_lcd.h"
++#include "video_core/pica_types.h"
++
++namespace Memory {
++class MemorySystem;
++}
++
++namespace Pica {
++class PicaCore;
++}
++
++namespace VideoCore {
++
++class RasterizerInterface;
++class RendererBase;
++
++/// Target display rate in frames per second; 0 disables interpolation (the game's own rate).
++/// Must be set before the GPU is created.
++void SetDisplayRate(double fps);
++double GetDisplayRate();
++
++class FrameInterpolator {
++public:
++    FrameInterpolator(Pica::PicaCore& pica, Memory::MemorySystem& memory);
++    ~FrameInterpolator();
++
++    // ---- Recording (called by the GPU while the game runs) ----------------------------------
++
++    void RecordFill(u32 index, const Pica::MemoryFillConfig& config);
++    void RecordTransfer(const Pica::DisplayTransferConfig& config);
++    void RecordCmdList(PAddr addr, u32 size);
++    /// A command list segment was read (the first one, or a chained one).
++    void RecordWords(PAddr addr, const u8* data, u32 size);
++    /// A draw was triggered: snapshot what it reads and its uniforms.
++    void RecordDraw(bool is_indexed);
++    /// The game swapped the top screen's framebuffer: the frame is complete.
++    void EndFrame(u64 ticks);
++
++    // ---- Replay (called by the PICA core while a frame is replayed) --------------------------
++
++    /// Command list words for a replayed list (from the recording, not from game memory).
++    const u8* ReplayWords(PAddr addr, u32 size);
++    void BeginReplayDraw();
++    void EndReplayDraw();
++
++    /// Render and present the frame for emulated time `now_ticks`.
++    void Present(u64 now_ticks, RasterizerInterface& rasterizer, RendererBase& renderer);
++
++private:
++    struct Op {
++        enum class Type : u8 { Fill, Transfer, CmdList } type;
++        u32 index;
++        PAddr addr;
++        u32 size;
++        std::array<u32, 12> config;
++    };
++    struct Range {
++        PAddr addr;
++        u32 size;
++        u32 blob_offset;
++    };
++    struct Draw {
++        u64 key;
++        std::array<Common::Vec4<Pica::f24>, 96> f;
++        u32 first_range;
++        u32 num_ranges;
++    };
++    struct Segment {
++        PAddr addr;
++        u32 size;
++        u32 blob_offset;
++    };
++    struct Frame {
++        std::string start_state;
++        std::vector<Op> ops;
++        std::vector<Draw> draws;
++        std::vector<Range> ranges;
++        std::vector<Segment> segments;
++        std::vector<u8> blob;
++        std::array<Pica::FramebufferConfig, 2> framebuffer_config;
++        Pica::RegsLcd regs_lcd;
++        std::vector<PAddr> transfer_outputs;
++        u64 end_ticks = 0;
++        u64 serial = 0;
++        bool started = false;
++
++        void Clear();
++    };
++    enum class Blend : u8 { Same, Lerp };
++
++    void BeginFrameIfNeeded();
++    void MatchFrames();
++    void Replay(const Frame& frame, float t, RasterizerInterface& rasterizer);
++    u32 AddBlob(const u8* data, u32 size);
++
++    Pica::PicaCore& pica;
++    Memory::MemorySystem& memory;
++
++    Frame recording;
++    Frame frames[2];       // frames[1] is the newest complete frame, frames[0] the one before
++    u64 next_serial = 1;
++
++    // Per draw of frames[1]: index of the matching draw in frames[0] (or -1) and how to blend
++    std::vector<s32> match;
++    std::vector<Blend> blend;
++    bool cut = false;
++
++    // Replay state
++    const Frame* replaying = nullptr;
++    float replay_t = 1.0f;
++    u32 replay_draw = 0;
++    u32 replay_segment = 0;
++    std::vector<std::pair<u8*, std::vector<u8>>> overlay; // memory to restore after a draw
++    std::array<Common::Vec4<Pica::f24>, 96> saved_uniforms;
++    bool uniforms_overridden = false;
++
++    u64 last_serial = 0;
++    u64 debug_counter = 0;
++    u64 replay_us = 0, replays = 0;
++    float last_t = -1.0f;
++};
++
++} // namespace VideoCore
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index 40f29fea0..c5733ee96 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -5,12 +5,14 @@
+ #include "common/archives.h"
+ #include "common/hacks/hack_manager.h"
+ #include "common/microprofile.h"
++#include "common/settings.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
+ #include "core/hle/service/gsp/gsp_gpu.h"
+ #include "core/hle/service/plgldr/plgldr.h"
+ #include "core/loader/loader.h"
+ #include "video_core/debug_utils/debug_utils.h"
++#include "video_core/frame_interpolator.h"
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_debugger.h"
+ #include "video_core/gpu_impl.h"
+@@ -95,6 +97,19 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
+         [this](uintptr_t user_data, s64 cycles_late) { VBlankCallback(user_data, cycles_late); });
+     impl->timing.ScheduleEvent(FRAME_TICKS, impl->vblank_event);
+ 
++    // Display-rate frame interpolation: the game's GPU work is recorded, and the screens are
++    // rendered and presented at the display rate instead of at each vblank.
++    if (GetDisplayRate() > 0.0) {
++        impl->interp = std::make_unique<FrameInterpolator>(impl->pica, impl->memory);
++        impl->pica.SetRecorder(impl->interp.get());
++        impl->display_interval =
++            static_cast<double>(BASE_CLOCK_RATE_ARM11) / GetDisplayRate();
++        impl->display_event = impl->timing.RegisterEvent(
++            "GPU::DisplayCallback",
++            [this](uintptr_t user_data, s64 cycles_late) { DisplayCallback(cycles_late); });
++        impl->timing.ScheduleEvent(static_cast<s64>(impl->display_interval), impl->display_event);
++    }
++
+     // Bind the rasterizer to the PICA GPU
+     impl->pica.BindRasterizer(impl->rasterizer);
+ }
+@@ -279,6 +294,10 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
+         impl->debug_context->OnEvent(Pica::DebugContext::Event::BufferSwapped, nullptr);
+     }
+ 
++    if (screen_id == 0 && impl->interp) {
++        impl->interp->EndFrame(static_cast<u64>(impl->timing.GetTicks()));
++    }
++
+     if (screen_id == 0) {
+         MicroProfileFlip();
+         impl->system.perf_stats->EndGameFrame();
+@@ -407,8 +426,11 @@ void GPU::SubmitCmdList(u32 index) {
+     // Forward command list processing to the PICA core.
+     const PAddr addr = config.GetPhysicalAddress(index);
+     const u32 size = config.GetSize(index);
+-    impl->pica.ProcessCmdList(addr, size,
+-                              !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
++    const bool ignore = !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size);
++    if (impl->interp && !ignore) {
++        impl->interp->RecordCmdList(addr, size);
++    }
++    impl->pica.ProcessCmdList(addr, size, ignore);
+     config.trigger[index] = 0;
+ }
+ 
+@@ -419,8 +441,10 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
+         return;
+     }
+ 
+-    // Perform memory fill.
+-    if (!impl->rasterizer->AccelerateFill(config)) {
++    // Perform memory fill (or record it, to be performed when the frame is presented).
++    if (impl->interp) {
++        impl->interp->RecordFill(index, config);
++    } else if (!impl->rasterizer->AccelerateFill(config)) {
+         impl->sw_blitter->MemoryFill(config);
+     }
+ 
+@@ -461,15 +485,19 @@ void GPU::MemoryTransfer() {
+ 
+     u64 delay{};
+     // Perform memory transfer
++    if (impl->interp) {
++        impl->interp->RecordTransfer(config);
++    }
+     if (config.is_texture_copy) {
+-        if (!impl->rasterizer->AccelerateTextureCopy(config)) {
++        if (!impl->interp && !impl->rasterizer->AccelerateTextureCopy(config)) {
+             impl->sw_blitter->TextureCopy(config);
+         }
+         delay = DelayGenerator::CalculateDelayNanoseconds(
+             DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
+             config.texture_copy.size);
+     } else {
+-        if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
++        if (!impl->interp &&
++            right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
+                                                            config.input_height)) {
+             if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
+                 impl->sw_blitter->DisplayTransfer(config);
+@@ -490,13 +518,29 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
+     impl->signal_interrupt(Service::GSP::InterruptId::PDC0, 0);
+     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
+ 
+-    // Present renderered frame.
+-    impl->renderer->SwapBuffers();
++    // Present renderered frame (with interpolation, frames are presented by DisplayCallback).
++    if (!impl->interp) {
++        impl->renderer->SwapBuffers();
++    }
+ 
+     // Reschedule recurrent event
+     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
+ }
+ 
++void GPU::DisplayCallback(s64 cycles_late) {
++    impl->interp->Present(static_cast<u64>(impl->timing.GetTicks()), *impl->rasterizer,
++                          *impl->renderer);
++    // The display rate is in real time: when the game runs faster or slower than normal
++    // (fast-forward), present proportionally fewer or more frames per emulated second.
++    const double limit = Settings::GetFrameLimit();
++    const double speed = limit <= 0.0 ? 4.0 : limit / 100.0;
++    // Keep the long-run rate exact although the interval is not a whole number of ticks
++    impl->display_error += impl->display_interval * speed;
++    const s64 next = static_cast<s64>(impl->display_error);
++    impl->display_error -= static_cast<double>(next);
++    impl->timing.ScheduleEvent(std::max<s64>(next - cycles_late, 1), impl->display_event);
++}
++
+ void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow* secondary_window) {
+     // Reset the renderer (this will destroy OpenGL resources)
+     impl->renderer.reset();
+diff --git a/src/video_core/gpu.h b/src/video_core/gpu.h
+index 2298f395d..fead62a5a 100644
+--- a/src/video_core/gpu.h
++++ b/src/video_core/gpu.h
+@@ -108,6 +108,7 @@ private:
+     void MemoryTransfer();
+ 
+     void VBlankCallback(uintptr_t user_data, s64 cycles_late);
++    void DisplayCallback(s64 cycles_late);
+ 
+     friend class boost::serialization::access;
+     template <class Archive>
+diff --git a/src/video_core/gpu_impl.h b/src/video_core/gpu_impl.h
+index 015918fe1..9cf4467a7 100644
+--- a/src/video_core/gpu_impl.h
++++ b/src/video_core/gpu_impl.h
+@@ -12,6 +12,7 @@
+ #include "core/hle/service/gsp/gsp_gpu.h"
+ #include "core/hle/service/plgldr/plgldr.h"
+ #include "video_core/debug_utils/debug_utils.h"
++#include "video_core/frame_interpolator.h"
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_debugger.h"
+ #include "video_core/gpu_impl.h"
+@@ -34,6 +35,10 @@ struct GPU::Impl {
+     RasterizerInterface* rasterizer;
+     std::unique_ptr<SwRenderer::SwBlitter> sw_blitter;
+     Core::TimingEventType* vblank_event;
++    std::unique_ptr<FrameInterpolator> interp;
++    Core::TimingEventType* display_event = nullptr;
++    double display_interval = 0.0;
++    double display_error = 0.0;
+     Service::GSP::InterruptHandler signal_interrupt;
+ 
+     explicit Impl(Core::System& system, Frontend::EmuWindow& emu_window,
+diff --git a/src/video_core/pica/pica_core.cpp b/src/video_core/pica/pica_core.cpp
+index 910ebc202..c1c6b23a0 100644
+--- a/src/video_core/pica/pica_core.cpp
++++ b/src/video_core/pica/pica_core.cpp
+@@ -8,7 +8,11 @@
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "core/core.h"
++#include <sstream>
++#include "common/archives.h"
++#include "common/scope_exit.h"
+ #include "core/memory.h"
++#include "video_core/frame_interpolator.h"
+ #include "video_core/debug_utils/debug_utils.h"
+ #include "video_core/pica/pica_core.h"
+ #include "video_core/pica/vertex_loader.h"
+@@ -254,13 +258,57 @@ static constexpr std::array<u32, 16> ExpandBitsToBytes = {
+  * On the other hand, if PICA debugging is enabled we should avoid optimizations
+  * that would make debugging more complicated.
+  */
++void PicaCore::SignalInterrupt(Service::GSP::InterruptId id, u64 delay) {
++    // A replayed frame already signalled its interrupts when the game submitted it
++    if (!replayer) {
++        signal_interrupt(id, delay);
++    }
++}
++
++const u8* PicaCore::CmdListPointer(PAddr addr, u32 size) {
++    if (replayer) {
++        return replayer->ReplayWords(addr, size);
++    }
++    const u8* head = memory.GetPhysicalPointer(addr);
++    if (recorder) {
++        recorder->RecordWords(addr, head, size);
++    }
++    return head;
++}
++
++std::string PicaCore::SaveState() {
++    std::ostringstream stream;
++    {
++        oarchive archive{stream};
++        serialize(archive, 0);
++    }
++    return std::move(stream).str();
++}
++
++void PicaCore::LoadState(const std::string& state) {
++    if (state.empty()) {
++        return;
++    }
++    std::istringstream stream{state};
++    {
++        iarchive archive{stream};
++        serialize(archive, 0);
++    }
++    dirty_regs.SetAllDirty();
++    vs_setup.uniforms_dirty = true;
++    gs_setup.uniforms_dirty = true;
++}
++
+ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
+     if (ignore_list) {
+-        signal_interrupt(Service::GSP::InterruptId::P3D, delay_generator.CalculateAndResetDelay());
++        SignalInterrupt(Service::GSP::InterruptId::P3D, delay_generator.CalculateAndResetDelay());
+         return;
+     }
+ 
+-    const u8* head = memory.GetPhysicalPointer(list);
++    const u8* head = CmdListPointer(list, size);
++    if (!head && replayer) {
++        return;
++    }
+     cmd_list.Reset(list, head, size);
+ 
+     bool stop_requested = false;
+@@ -581,8 +629,8 @@ void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
+         // TODO(PabloMK7): This logic is not fully accurate, but close enough:
+         // https://problemkaputt.de/gbatek-3ds-gpu-internal-registers-finalize-interrupt-registers.htm
+         if (any_byte_match(regs.internal.reg_array[id], regs.internal.irq_compare)) [[likely]] {
+-            signal_interrupt(Service::GSP::InterruptId::P3D,
+-                             delay_generator.CalculateAndResetDelay());
++            SignalInterrupt(Service::GSP::InterruptId::P3D,
++                            delay_generator.CalculateAndResetDelay());
+             if (regs.internal.irq_autostop) [[likely]] {
+                 stop_requested = true;
+             }
+@@ -617,7 +665,11 @@ void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
+         const u32 index = static_cast<u32>(id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
+         const PAddr addr = regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
+         const u32 size = regs.internal.pipeline.command_buffer.GetSize(index);
+-        const u8* head = memory.GetPhysicalPointer(addr);
++        const u8* head = CmdListPointer(addr, size);
++        if (!head && replayer) {
++            stop_requested = true;
++            break;
++        }
+         cmd_list.Reset(addr, head, size);
+         break;
+     }
+@@ -1007,6 +1059,12 @@ void PicaCore::SubmitImmediate(u32 value) {
+ }
+ 
+ void PicaCore::DrawImmediate() {
++    if (recorder) {
++        // Recorded with the command list; drawn when the frame is replayed
++        immediate.current_attribute = 0;
++        return;
++    }
++
+     // Compile the vertex shader.
+     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+ 
+@@ -1047,6 +1105,21 @@ void PicaCore::DrawImmediate() {
+ void PicaCore::DrawArrays(bool is_indexed) {
+     MICROPROFILE_SCOPE(GPU_Drawing);
+ 
++    if (recorder) {
++        delay_generator.AddVertices(regs.internal.pipeline.num_vertices,
++                                    regs.internal.pipeline.triangle_topology);
++        recorder->RecordDraw(is_indexed);
++        return;
++    }
++    if (replayer) {
++        replayer->BeginReplayDraw();
++    }
++    SCOPE_EXIT({
++        if (replayer) {
++            replayer->EndReplayDraw();
++        }
++    });
++
+     // Track vertex in the debug recorder.
+     if (debug_context) {
+         debug_context->OnEvent(DebugContext::Event::IncomingPrimitiveBatch, nullptr);
+@@ -1083,6 +1156,7 @@ void PicaCore::DrawArrays(bool is_indexed) {
+         return;
+     }
+ 
++
+     // We cannot accelerate the draw, so load and execute the vertex shader for each vertex.
+     LoadVertices(is_indexed);
+ 
+diff --git a/src/video_core/pica/pica_core.h b/src/video_core/pica/pica_core.h
+index 62b04956b..6216d18c4 100644
+--- a/src/video_core/pica/pica_core.h
++++ b/src/video_core/pica/pica_core.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <string>
+ #include "common/common_types.h"
+ #include "core/hle/service/gsp/gsp_interrupt.h"
+ #include "video_core/pica/dirty_regs.h"
+@@ -21,6 +22,7 @@ class MemorySystem;
+ }
+ 
+ namespace VideoCore {
++class FrameInterpolator;
+ class RasterizerInterface;
+ }
+ 
+@@ -120,6 +122,27 @@ public:
+ 
+     void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
+ 
++    /// Frame interpolation: when a recorder is set, draws are recorded instead of rasterized.
++    void SetRecorder(VideoCore::FrameInterpolator* recorder_) {
++        recorder = recorder_;
++    }
++    /// Frame interpolation: while set, a recorded frame is being replayed (no interrupts, command
++    /// words and vertex data come from the recording).
++    void SetReplayMode(VideoCore::FrameInterpolator* replayer_) {
++        // Nothing is recorded while a frame is replayed
++        if (replayer_ && !replayer) {
++            paused_recorder = recorder;
++            recorder = nullptr;
++        } else if (!replayer_ && replayer) {
++            recorder = paused_recorder;
++            paused_recorder = nullptr;
++        }
++        replayer = replayer_;
++    }
++    /// Snapshot / restore of the whole GPU state (registers, shaders, LUTs).
++    std::string SaveState();
++    void LoadState(const std::string& state);
++
+ private:
+     void InitializeRegs();
+ 
+@@ -140,6 +163,8 @@ private:
+     void DrawImmediate();
+ 
+     void DrawArrays(bool is_indexed);
++    void SignalInterrupt(Service::GSP::InterruptId id, u64 delay);
++    const u8* CmdListPointer(PAddr addr, u32 size);
+ 
+     void LoadVertices(bool is_indexed);
+ 
+@@ -411,6 +436,9 @@ private:
+     PrimitiveAssembler primitive_assembler;
+     CommandList cmd_list;
+     std::unique_ptr<ShaderEngine> shader_engine;
++    VideoCore::FrameInterpolator* recorder = nullptr;
++    VideoCore::FrameInterpolator* replayer = nullptr;
++    VideoCore::FrameInterpolator* paused_recorder = nullptr;
+ };
+ 
+ #define GPU_REG_INDEX(field_name) (offsetof(Pica::PicaCore::Regs, field_name) / sizeof(u32))
