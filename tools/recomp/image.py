@@ -24,7 +24,11 @@ class Image:
         return any(s <= a and a + size <= e for s, e in self.code_ranges)
 
     def is_const(self, a, size):
-        return any(s <= a and a + size <= e for s, e in self.const_ranges)
+        """True if [a, a+size) is read-only and never patched at load time (safe to fold)."""
+        if not any(s <= a and a + size <= e for s, e in self.const_ranges):
+            return False
+        # ldr:ro patches some words of the main executable's text and rodata when modules load
+        return not any(w in self.relocs for w in range(a & ~3, a + size, 4))
 
     def read32(self, a):
         o = a - self.base

@@ -103,15 +103,18 @@ int main(int argc, char** argv) {
     std::string rom;
     bool fullscreen = true;
     bool pause_in_background = true;
-    const char* usage = "usage: %s [--windowed] [--keep-running] GAME.3ds\n"
+    const char* usage = "usage: %s [--windowed] [--keep-running] [--speed PERCENT] GAME.3ds\n"
                         "  --windowed      start in a window instead of fullscreen\n"
-                        "  --keep-running  keep playing while the window is in the background\n";
+                        "  --keep-running  keep playing while the window is in the background\n"
+                        "  --speed PERCENT game speed (100 = normal)\n";
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--windowed" || a == "-w")
             fullscreen = false;
         else if (a == "--keep-running")
             pause_in_background = false;
+        else if (a == "--speed" && i + 1 < argc)
+            Settings::values.frame_limit = std::atof(argv[++i]);
         else if (a == "--help" || a == "-h") {
             std::printf(usage, argv[0]);
             return 0;

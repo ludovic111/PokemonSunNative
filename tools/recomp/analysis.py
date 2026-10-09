@@ -410,4 +410,5 @@ def discover(img, seeds, candidates=()):
         run()
     total = sum(e - s for s, e in img.code_ranges)
     dec.coverage = sum(covered) / max(total, 1)
+    dec.covered = covered
     return dec, entries
