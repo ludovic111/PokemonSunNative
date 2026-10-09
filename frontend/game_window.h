@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,6 +49,29 @@ public:
     /// Refresh rate of the monitor the window is on, in Hz (0 if unknown).
     int RefreshRate() const;
 
+    SDL_Window* Handle() const {
+        return window;
+    }
+    bool IsFullscreen() const {
+        return fullscreen;
+    }
+    /// Borderless fullscreen on the current monitor, or a normal window.
+    void SetFullscreen(bool on);
+    /// Index of the monitor the window is on.
+    int CurrentMonitor() const;
+    /// Put the game on another monitor (fullscreen there if it is fullscreen).
+    void MoveToMonitor(int index);
+    /// Recompute the screen layout after a settings change.
+    void RefreshLayout() {
+        OnResize();
+    }
+    /// Events are offered to `filter` first (the settings menu); it returns true to keep them.
+    void SetEventFilter(std::function<bool(const SDL_Event&)> filter) {
+        event_filter = std::move(filter);
+    }
+    /// While a menu is open the game gets no input and the cursor stays visible.
+    void SetMenuOpen(bool open);
+
 private:
     void OnKey(int scancode, bool pressed, bool repeat, u16 mods);
     void OnMouseButton(u32 button, bool pressed, s32 x, s32 y);
@@ -67,6 +91,8 @@ private:
     bool fullscreen = false;
     bool turbo = false;
     std::string title;
+    std::function<bool(const SDL_Event&)> event_filter;
+    bool menu_open = false;
     u32 last_motion_ticks = 0;
     bool cursor_visible = true;
     // Keys pressed on behalf of the mouse wheel, released a few frames later

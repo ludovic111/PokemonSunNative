@@ -54,6 +54,32 @@ after `git pull` to rebuild.
 The game starts in borderless fullscreen at your monitor's refresh rate (see
 [Frame rate](#frame-rate)). Use `pokemon-sun --windowed` for a window, `--mute` for no sound.
 
+## Graphics settings
+
+Press **F1** in the game for the graphics menu (mouse or keyboard). Changes apply immediately and
+are saved in `~/.config/PokemonSunNative/settings.ini`.
+
+| Setting | Choices |
+|---|---|
+| Monitor | any connected monitor; the game moves there right away |
+| Mode | borderless fullscreen or a window (drag its title bar to move it) |
+| Frame rate | monitor refresh rate, original 30 FPS, presets 60–360, or any custom value |
+| V-Sync | automatic, off, on |
+| Resolution | match the window, or a fixed 1×–12×: 3× = 720p, 6× = **1440p / 2K**, 9× = **4K** |
+| Texture filter | none (original look), Anime4K, Bicubic, ScaleForce, xBRZ, MMPX |
+| Screen scaling | smooth or sharp |
+| Layout | big top screen with the touch screen beside it, stacked, side by side, overlapping, top screen only; touch screen size and corner; swap screens |
+
+The same can be set for one run from the command line:
+
+```sh
+pokemon-sun --resolution 1440p --fps 144 --monitor 2 --fullscreen
+```
+
+`--resolution` takes `auto`, a scale `1`–`15`, or a height (`720p`, `1080p`, `1440p`, `2160p`;
+rounded up to the next multiple of 240). "Match the window" already renders at your screen's
+resolution; a fixed higher value renders larger and scales down (supersampling, smoother edges).
+
 ## Frame rate
 
 Pokémon Sun runs its game logic at 30 FPS. PokemonSunNative shows as many frames per second as
@@ -92,6 +118,7 @@ not blended. In-game photos (Poké Finder) may capture the slightly older frame;
 | Start / Select | `Enter` / `Backspace` | |
 | Fast-forward (4×, hold) | `Tab` | |
 | Fullscreen | `F11` or `Alt+Enter` | |
+| Graphics settings | `F1` | |
 | Walk slowly (half tilt) | hold `Caps Lock` | |
 
 The game pauses while its window is in the background (`--keep-running` turns that off). The cursor hides after 3 seconds without

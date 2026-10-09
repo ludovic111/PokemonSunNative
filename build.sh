@@ -94,13 +94,43 @@ say "Translating the game's ARM code to C++"
 python3 -I -c "import sys; sys.path.insert(0, 'tools'); from recomp.__main__ import main; main()" \
   "$ROM" "$BUILD/gen" --tickcount "$BUILD/tickcount"
 
+# Development files that are often missing although the library itself is installed: give
+# pkg-config what it needs from headers we carry (the libraries are loaded at run time)
+shim=$BUILD/shim
+rm -rf "$shim" && mkdir -p "$shim/pkgconfig" "$shim/include" "$shim/lib"
+if ! pkg-config --exists egl 2>/dev/null; then
+  cp -r external/azahar/externals/sdl2/SDL/src/video/khronos/EGL external/azahar/externals/sdl2/SDL/src/video/khronos/KHR "$shim/include/"
+  printf 'Name: egl\nDescription: EGL headers (from SDL)\nVersion: 1.5\nCflags: -I%s/include\nLibs:\n' "$shim" > "$shim/pkgconfig/egl.pc"
+fi
+if ! pkg-config --exists libdecor-0 2>/dev/null; then
+  # Window title bars on GNOME (Wayland): needed to move the window between monitors
+  decor=$(ldconfig -p 2>/dev/null | awk '/libdecor-0\.so\.0 .*x86-64/ {print $NF; exit}')
+  if [ -n "$decor" ]; then
+    cp cmake/shim/libdecor.h "$shim/include/"
+    ln -sf "$decor" "$shim/lib/libdecor-0.so"
+    printf 'Name: libdecor\nDescription: libdecor header (vendored)\nVersion: 0.2.2\nCflags: -I%s/include\nLibs: -L%s/lib -ldecor-0\n' "$shim" "$shim" > "$shim/pkgconfig/libdecor-0.pc"
+  else
+    echo "   note: libdecor is not installed; on GNOME the game window will have no title bar (sudo apt install libdecor-0-0)"
+  fi
+fi
+export PKG_CONFIG_PATH="$shim/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+sdl_args=()
+# SDL stops on incomplete X11 development files; without them the game uses Wayland only
+pkg-config --exists x11 xext 2>/dev/null || sdl_args+=(-DSDL_X11=OFF)
+
+# Reconfigure when the configuration recipe changes (the compiled objects are kept)
+CONFIG_VERSION=2
+if [ -f "$BUILD/azahar/CMakeCache.txt" ] && [ "$(cat "$BUILD/azahar/.psn-config" 2>/dev/null)" != "$CONFIG_VERSION" ]; then
+  rm -f "$BUILD/azahar/CMakeCache.txt"
+fi
 if [ ! -f "$BUILD/azahar/CMakeCache.txt" ]; then
   say "Configuring"
   cmake -S external/azahar -B "$BUILD/azahar" "${generator[@]}" -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
     -DENABLE_QT=OFF -DENABLE_WEB_SERVICE=OFF -DENABLE_SCRIPTING=OFF -DENABLE_GDBSTUB=OFF \
     -DENABLE_TESTS=OFF -DENABLE_ROOM=OFF -DENABLE_LTO=OFF -DCITRA_WARNINGS_AS_ERRORS=OFF \
-    -DPSN_SOURCE_DIR="$ROOT" -DPSN_GEN_DIR="$BUILD/gen" ${PSN_CMAKE_ARGS:-}
+    -DPSN_SOURCE_DIR="$ROOT" -DPSN_GEN_DIR="$BUILD/gen" "${sdl_args[@]}" ${PSN_CMAKE_ARGS:-}
+  echo "$CONFIG_VERSION" > "$BUILD/azahar/.psn-config"
 fi
 
 sdl_config=$(find "$BUILD/azahar/externals/sdl2" -name SDL_config.h -path '*include-config*' 2>/dev/null | head -1)

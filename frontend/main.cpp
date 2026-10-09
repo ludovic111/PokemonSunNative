@@ -28,6 +28,8 @@
 #include "core/loader/loader.h"
 #include "core/loader/smdh.h"
 #include "game_window.h"
+#include "settings_menu.h"
+#include "user_settings.h"
 #include "input_common/main.h"
 #include "network/network.h"
 #include "video_core/frame_interpolator.h"
@@ -79,14 +81,9 @@ void ApplySettings() {
     auto& v = Settings::values;
     v.graphics_api = Settings::GraphicsAPI::Vulkan;
     v.physical_device = 0;
-    v.resolution_factor = 0; // follow the window size
     v.async_shader_compilation = true;
     v.use_disk_shader_cache = true;
     v.use_hw_shader = true;
-    v.use_vsync = true;
-    v.layout_option = Settings::LayoutOption::LargeScreen;
-    v.large_screen_proportion = 2.5f;
-    v.small_screen_position = Settings::SmallScreenPosition::BottomRight;
     v.is_new_3ds = true;
     v.lle_applets = false; // only the game itself is translated
     v.use_cpu_jit = false;
@@ -103,40 +100,67 @@ void ApplySettings() {
 
 int main(int argc, char** argv) {
     std::string rom;
-    bool fullscreen = true;
     bool pause_in_background = true;
-    double fps = -1.0; // -1: the monitor's refresh rate
+    // Saved settings (F1 in the game); command-line options override them for this run
+    UserSettings user;
+    user.Load();
     const char* usage =
-        "usage: %s [--fps N|native] [--windowed] [--keep-running] [--speed PERCENT] GAME.3ds\n"
-        "  --fps N         frames per second to display (default: your monitor's refresh rate).\n"
-        "                  The game runs at its normal speed; frames in between are interpolated.\n"
-        "  --fps native    the game's own 30 FPS, without interpolation\n"
-        "  --windowed      start in a window instead of fullscreen\n"
-        "  --keep-running  keep playing while the window is in the background\n"
-        "  --mute          no sound\n"
-        "  --speed PERCENT game speed (100 = normal)\n";
+        "usage: %s [options] GAME.3ds\n"
+        "Settings are saved from the in-game menu (F1); these options override them once:\n"
+        "  --fps N            frames per second to show, 10 to 1000 (default: the monitor's\n"
+        "                     refresh rate); in-between frames are interpolated\n"
+        "  --fps native       the game's own 30 FPS, without interpolation\n"
+        "  --resolution R     3D rendering resolution: auto, a scale 1-15 (x 240p), or a\n"
+        "                     height such as 720p, 1080p, 1440p, 2160p\n"
+        "  --windowed         start in a window      --fullscreen   start fullscreen\n"
+        "  --monitor N        start on monitor N (1 = first)\n"
+        "  --keep-running     keep playing while the window is in the background\n"
+        "  --mute             no sound\n"
+        "  --speed PERCENT    game speed (100 = normal)\n";
+    auto value_of = [&](int& i, const std::string& a, const char* name) -> std::string {
+        const std::string eq = std::string(name) + "=";
+        if (a.rfind(eq, 0) == 0)
+            return a.substr(eq.size());
+        if (a == name && i + 1 < argc)
+            return argv[++i];
+        return {};
+    };
     for (int i = 1; i < argc; i++) {
-        std::string a = argv[i];
+        const std::string a = argv[i];
+        std::string v;
         if (a == "--windowed" || a == "-w")
-            fullscreen = false;
+            user.fullscreen = false;
+        else if (a == "--fullscreen")
+            user.fullscreen = true;
         else if (a == "--keep-running")
             pause_in_background = false;
         else if (a == "--mute")
             Settings::values.output_type = AudioCore::SinkType::Null;
-        else if (a == "--speed" && i + 1 < argc)
-            Settings::values.frame_limit = std::atof(argv[++i]);
-        else if (a == "--fps" && i + 1 < argc) {
-            const std::string v = argv[++i];
-            fps = (v == "native" || v == "0") ? 0.0 : std::atof(v.c_str());
-            if (fps < 0.0 || (fps > 0.0 && fps < 10.0) || fps > 1000.0) {
+        else if (!(v = value_of(i, a, "--speed")).empty())
+            Settings::values.frame_limit = std::atof(v.c_str());
+        else if (!(v = value_of(i, a, "--monitor")).empty())
+            user.monitor = std::max(0, std::atoi(v.c_str()) - 1);
+        else if (!(v = value_of(i, a, "--fps")).empty()) {
+            const int f = (v == "native" || v == "0") ? 0 : std::atoi(v.c_str());
+            if (f != 0 && (f < 10 || f > 1000)) {
                 std::fprintf(stderr, "--fps: expected a number from 10 to 1000, or native\n");
                 return 1;
             }
-        } else if (a.rfind("--fps=", 0) == 0) {
-            const std::string v = a.substr(6);
-            fps = (v == "native" || v == "0") ? 0.0 : std::atof(v.c_str());
-        }
-        else if (a == "--help" || a == "-h") {
+            user.fps = f;
+        } else if (!(v = value_of(i, a, "--resolution")).empty()) {
+            int r = -1;
+            if (v == "auto" || v == "0")
+                r = 0;
+            else if (v.back() == 'p' || v.back() == 'P')
+                r = (std::atoi(v.c_str()) + 239) / 240; // smallest scale at least that tall
+            else
+                r = std::atoi(v.c_str());
+            if (r < 0 || r > 15) {
+                std::fprintf(stderr, "--resolution: expected auto, 1-15 or a height like 1440p\n");
+                return 1;
+            }
+            user.resolution = r;
+        } else if (a == "--help" || a == "-h") {
             std::printf(usage, argv[0]);
             return 0;
         } else
@@ -177,20 +201,22 @@ int main(int argc, char** argv) {
     Frontend::RegisterDefaultApplets(system);
 
     GameWindow::InitializeSDL();
-    auto window = std::make_unique<GameWindow>(system, fullscreen);
+    auto window = std::make_unique<GameWindow>(system, false);
     const auto scope = window->Acquire();
+    if (user.monitor >= 0)
+        window->MoveToMonitor(user.monitor);
+    if (user.fullscreen)
+        window->SetFullscreen(true);
 
-    // Display rate: interpolate the game's frames up to the monitor's refresh rate (or --fps)
-    const int refresh = window->RefreshRate();
-    if (fps < 0.0)
-        fps = refresh > 0 ? refresh : 60.0;
-    if (fps > 0.0) {
-        VideoCore::SetDisplayRate(fps);
-        // Sync to the display when showing one frame per refresh; above that, don't wait for it
-        Settings::values.use_vsync = refresh <= 0 || fps <= refresh + 1;
-    }
-    LOG_INFO(Frontend, "Display: {} Hz monitor, showing {}", refresh,
-             fps > 0.0 ? fmt::format("{:g} FPS (interpolated)", fps) : "the game's own frames");
+    // Graphics settings: resolution, filters, layout, display rate (interpolated up to the
+    // monitor's refresh rate unless set otherwise), vsync
+    SettingsMenu::Apply(user, *window, true);
+    SettingsMenu menu(*window, user);
+    window->SetEventFilter([&menu](const SDL_Event& e) { return menu.HandleEvent(e); });
+    LOG_INFO(Frontend, "Display: {} Hz monitor, showing {}", window->RefreshRate(),
+             VideoCore::GetDisplayRate() > 0.0
+                 ? fmt::format("{:g} FPS (interpolated)", VideoCore::GetDisplayRate())
+                 : std::string("the game's own frames"));
 
     const auto result = system.Load(*window, rom);
     if (result != Core::System::ResultStatus::Success) {
@@ -198,6 +224,7 @@ int main(int argc, char** argv) {
                      system.GetStatusDetails());
         return 1;
     }
+    system.GPU().Renderer().SetOverlay(&menu);
 
     // Window title and icon from the game itself
     std::vector<u8> smdh_data;
@@ -230,12 +257,15 @@ int main(int argc, char** argv) {
                       system.GetStatusDetails());
         if (SDL_GetTicks() - last_stats > 1000) {
             const auto stats = system.GetAndResetPerfStats();
-            window->UpdatePerformanceInfo(fps > 0.0 ? stats.system_fps : stats.game_fps,
+            window->UpdatePerformanceInfo(VideoCore::GetDisplayRate() > 0.0 ? stats.system_fps
+                                                                            : stats.game_fps,
                                           stats.emulation_speed);
             last_stats = SDL_GetTicks();
         }
     }
     window->RequestClose();
+    system.GPU().Renderer().SetOverlay(nullptr);
+    menu.ReleaseGpu();
     Network::Shutdown();
     InputCommon::Shutdown();
     system.Shutdown();

@@ -203,10 +203,10 @@ index 528072c9a..b03a1d6f6 100644
      gpu_debugger.h
 diff --git a/src/video_core/frame_interpolator.cpp b/src/video_core/frame_interpolator.cpp
 new file mode 100644
-index 000000000..89ee671f6
+index 000000000..9e32d93d9
 --- /dev/null
 +++ b/src/video_core/frame_interpolator.cpp
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,448 @@
 +// Copyright 2026 PokemonSunNative contributors
 +// Licensed under GPLv2 or any later version
 +// Refer to the license.txt file included.
@@ -287,6 +287,19 @@ index 000000000..89ee671f6
 +    : pica{pica_}, memory{memory_} {}
 +
 +FrameInterpolator::~FrameInterpolator() = default;
++
++void FrameInterpolator::Reset() {
++    recording.Clear();
++    for (Frame& f : frames) {
++        f.Clear();
++        f.serial = 0;
++    }
++    match.clear();
++    blend.clear();
++    cut = false;
++    last_serial = 0;
++    last_t = -1.0f;
++}
 +
 +u32 FrameInterpolator::AddBlob(const u8* data, u32 size) {
 +    const u32 offset = static_cast<u32>(recording.blob.size());
@@ -644,10 +657,10 @@ index 000000000..89ee671f6
 +} // namespace VideoCore
 diff --git a/src/video_core/frame_interpolator.h b/src/video_core/frame_interpolator.h
 new file mode 100644
-index 000000000..aeada797e
+index 000000000..d25a2b3fa
 --- /dev/null
 +++ b/src/video_core/frame_interpolator.h
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,150 @@
 +// Copyright 2026 PokemonSunNative contributors
 +// Licensed under GPLv2 or any later version
 +// Refer to the license.txt file included.
@@ -697,6 +710,9 @@ index 000000000..aeada797e
 +public:
 +    FrameInterpolator(Pica::PicaCore& pica, Memory::MemorySystem& memory);
 +    ~FrameInterpolator();
++
++    /// Forget all recorded frames (when interpolation is turned back on).
++    void Reset();
 +
 +    // ---- Recording (called by the GPU while the game runs) ----------------------------------
 +
@@ -796,7 +812,7 @@ index 000000000..aeada797e
 +
 +} // namespace VideoCore
 diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
-index 40f29fea0..c5733ee96 100644
+index 40f29fea0..c14614a77 100644
 --- a/src/video_core/gpu.cpp
 +++ b/src/video_core/gpu.cpp
 @@ -5,12 +5,14 @@
@@ -814,74 +830,73 @@ index 40f29fea0..c5733ee96 100644
  #include "video_core/gpu.h"
  #include "video_core/gpu_debugger.h"
  #include "video_core/gpu_impl.h"
-@@ -95,6 +97,19 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
+@@ -95,6 +97,15 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
          [this](uintptr_t user_data, s64 cycles_late) { VBlankCallback(user_data, cycles_late); });
      impl->timing.ScheduleEvent(FRAME_TICKS, impl->vblank_event);
  
 +    // Display-rate frame interpolation: the game's GPU work is recorded, and the screens are
-+    // rendered and presented at the display rate instead of at each vblank.
-+    if (GetDisplayRate() > 0.0) {
-+        impl->interp = std::make_unique<FrameInterpolator>(impl->pica, impl->memory);
-+        impl->pica.SetRecorder(impl->interp.get());
-+        impl->display_interval =
-+            static_cast<double>(BASE_CLOCK_RATE_ARM11) / GetDisplayRate();
-+        impl->display_event = impl->timing.RegisterEvent(
-+            "GPU::DisplayCallback",
-+            [this](uintptr_t user_data, s64 cycles_late) { DisplayCallback(cycles_late); });
-+        impl->timing.ScheduleEvent(static_cast<s64>(impl->display_interval), impl->display_event);
-+    }
++    // rendered and presented at the display rate instead of at each vblank. It can be turned on
++    // and off while the game runs (see UpdateInterpolation).
++    impl->interp = std::make_unique<FrameInterpolator>(impl->pica, impl->memory);
++    impl->display_event = impl->timing.RegisterEvent(
++        "GPU::DisplayCallback",
++        [this](uintptr_t user_data, s64 cycles_late) { DisplayCallback(cycles_late); });
++    UpdateInterpolation();
 +
      // Bind the rasterizer to the PICA GPU
      impl->pica.BindRasterizer(impl->rasterizer);
  }
-@@ -279,6 +294,10 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
+@@ -279,6 +290,13 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
          impl->debug_context->OnEvent(Pica::DebugContext::Event::BufferSwapped, nullptr);
      }
  
-+    if (screen_id == 0 && impl->interp) {
-+        impl->interp->EndFrame(static_cast<u64>(impl->timing.GetTicks()));
++    if (screen_id == 0) {
++        if (impl->interp_active) {
++            impl->interp->EndFrame(static_cast<u64>(impl->timing.GetTicks()));
++        }
++        UpdateInterpolation();
 +    }
 +
      if (screen_id == 0) {
          MicroProfileFlip();
          impl->system.perf_stats->EndGameFrame();
-@@ -407,8 +426,11 @@ void GPU::SubmitCmdList(u32 index) {
+@@ -407,8 +425,11 @@ void GPU::SubmitCmdList(u32 index) {
      // Forward command list processing to the PICA core.
      const PAddr addr = config.GetPhysicalAddress(index);
      const u32 size = config.GetSize(index);
 -    impl->pica.ProcessCmdList(addr, size,
 -                              !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
 +    const bool ignore = !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size);
-+    if (impl->interp && !ignore) {
++    if (impl->interp_active && !ignore) {
 +        impl->interp->RecordCmdList(addr, size);
 +    }
 +    impl->pica.ProcessCmdList(addr, size, ignore);
      config.trigger[index] = 0;
  }
  
-@@ -419,8 +441,10 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
+@@ -419,8 +440,10 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
          return;
      }
  
 -    // Perform memory fill.
 -    if (!impl->rasterizer->AccelerateFill(config)) {
 +    // Perform memory fill (or record it, to be performed when the frame is presented).
-+    if (impl->interp) {
++    if (impl->interp_active) {
 +        impl->interp->RecordFill(index, config);
 +    } else if (!impl->rasterizer->AccelerateFill(config)) {
          impl->sw_blitter->MemoryFill(config);
      }
  
-@@ -461,15 +485,19 @@ void GPU::MemoryTransfer() {
+@@ -461,15 +484,19 @@ void GPU::MemoryTransfer() {
  
      u64 delay{};
      // Perform memory transfer
-+    if (impl->interp) {
++    if (impl->interp_active) {
 +        impl->interp->RecordTransfer(config);
 +    }
      if (config.is_texture_copy) {
 -        if (!impl->rasterizer->AccelerateTextureCopy(config)) {
-+        if (!impl->interp && !impl->rasterizer->AccelerateTextureCopy(config)) {
++        if (!impl->interp_active && !impl->rasterizer->AccelerateTextureCopy(config)) {
              impl->sw_blitter->TextureCopy(config);
          }
          delay = DelayGenerator::CalculateDelayNanoseconds(
@@ -889,19 +904,19 @@ index 40f29fea0..c5733ee96 100644
              config.texture_copy.size);
      } else {
 -        if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
-+        if (!impl->interp &&
++        if (!impl->interp_active &&
 +            right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
                                                             config.input_height)) {
              if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
                  impl->sw_blitter->DisplayTransfer(config);
-@@ -490,13 +518,29 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
+@@ -490,13 +517,60 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
      impl->signal_interrupt(Service::GSP::InterruptId::PDC0, 0);
      impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
  
 -    // Present renderered frame.
 -    impl->renderer->SwapBuffers();
 +    // Present renderered frame (with interpolation, frames are presented by DisplayCallback).
-+    if (!impl->interp) {
++    if (!impl->interp_active) {
 +        impl->renderer->SwapBuffers();
 +    }
  
@@ -909,7 +924,38 @@ index 40f29fea0..c5733ee96 100644
      impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
  }
  
++void GPU::UpdateInterpolation() {
++    // Called between game frames, when switching cannot split a frame
++    const bool want = GetDisplayRate() > 0.0;
++    if (want && !impl->interp_active) {
++        LOG_INFO(HW_GPU, "Frame interpolation on ({} FPS)", GetDisplayRate());
++        impl->interp->Reset();
++        impl->pica.SetRecorder(impl->interp.get());
++        impl->interp_active = true;
++        impl->display_error = 0.0;
++        if (!impl->display_scheduled) {
++            impl->display_scheduled = true;
++            impl->timing.ScheduleEvent(1, impl->display_event);
++        }
++    } else if (!want && impl->interp_active) {
++        LOG_INFO(HW_GPU, "Frame interpolation off");
++        impl->pica.SetRecorder(nullptr);
++        impl->interp_active = false;
++    }
++}
++
 +void GPU::DisplayCallback(s64 cycles_late) {
++    if (!impl->interp_active) {
++        impl->display_scheduled = false;
++        return;
++    }
++    // The rate can be 0 until the next game frame turns interpolation off: keep the last one
++    const double rate = GetDisplayRate();
++    if (rate > 0.0) {
++        impl->display_interval = static_cast<double>(BASE_CLOCK_RATE_ARM11) / rate;
++    } else if (impl->display_interval <= 0.0) {
++        impl->display_interval = static_cast<double>(FRAME_TICKS);
++    }
 +    impl->interp->Present(static_cast<u64>(impl->timing.GetTicks()), *impl->rasterizer,
 +                          *impl->renderer);
 +    // The display rate is in real time: when the game runs faster or slower than normal
@@ -927,19 +973,20 @@ index 40f29fea0..c5733ee96 100644
      // Reset the renderer (this will destroy OpenGL resources)
      impl->renderer.reset();
 diff --git a/src/video_core/gpu.h b/src/video_core/gpu.h
-index 2298f395d..fead62a5a 100644
+index 2298f395d..80f84ec4e 100644
 --- a/src/video_core/gpu.h
 +++ b/src/video_core/gpu.h
-@@ -108,6 +108,7 @@ private:
+@@ -108,6 +108,8 @@ private:
      void MemoryTransfer();
  
      void VBlankCallback(uintptr_t user_data, s64 cycles_late);
 +    void DisplayCallback(s64 cycles_late);
++    void UpdateInterpolation();
  
      friend class boost::serialization::access;
      template <class Archive>
 diff --git a/src/video_core/gpu_impl.h b/src/video_core/gpu_impl.h
-index 015918fe1..9cf4467a7 100644
+index 015918fe1..f73d4ee61 100644
 --- a/src/video_core/gpu_impl.h
 +++ b/src/video_core/gpu_impl.h
 @@ -12,6 +12,7 @@
@@ -950,12 +997,14 @@ index 015918fe1..9cf4467a7 100644
  #include "video_core/gpu.h"
  #include "video_core/gpu_debugger.h"
  #include "video_core/gpu_impl.h"
-@@ -34,6 +35,10 @@ struct GPU::Impl {
+@@ -34,6 +35,12 @@ struct GPU::Impl {
      RasterizerInterface* rasterizer;
      std::unique_ptr<SwRenderer::SwBlitter> sw_blitter;
      Core::TimingEventType* vblank_event;
 +    std::unique_ptr<FrameInterpolator> interp;
 +    Core::TimingEventType* display_event = nullptr;
++    bool interp_active = false;
++    bool display_scheduled = false;
 +    double display_interval = 0.0;
 +    double display_error = 0.0;
      Service::GSP::InterruptHandler signal_interrupt;
@@ -1171,3 +1220,120 @@ index 62b04956b..6216d18c4 100644
  };
  
  #define GPU_REG_INDEX(field_name) (offsetof(Pica::PicaCore::Regs, field_name) / sizeof(u32))
+diff --git a/src/video_core/renderer_base.h b/src/video_core/renderer_base.h
+index 4102e1879..7ab4f8486 100644
+--- a/src/video_core/renderer_base.h
++++ b/src/video_core/renderer_base.h
+@@ -4,6 +4,8 @@
+ 
+ #pragma once
+ 
++#include <functional>
++
+ #include "common/common_types.h"
+ #include "core/frontend/framebuffer_layout.h"
+ #include "video_core/rasterizer_interface.h"
+@@ -35,6 +37,28 @@ struct RendererSettings {
+     std::atomic_bool shader_update_requested{false};
+ };
+ 
++/// Something the frontend draws over the game screens (e.g. a settings menu), Vulkan only.
++class Overlay {
++public:
++    struct VulkanInfo {
++        void* instance;        // VkInstance
++        void* physical_device; // VkPhysicalDevice
++        void* device;          // VkDevice
++        u32 queue_family;
++        void* queue;           // VkQueue
++        void* render_pass;     // VkRenderPass of the final presentation pass
++        u32 api_version;
++        void* get_instance_proc_addr; // PFN_vkGetInstanceProcAddr
++    };
++    virtual ~Overlay() = default;
++    /// Called once, at a moment when nothing else uses the GPU queue.
++    virtual void InitVulkan(const VulkanInfo& info) = 0;
++    /// Called on the emulation thread for each presented frame of the given size. The returned
++    /// function (if any) is run later, on the render thread, inside the presentation render pass
++    /// with the frame's VkCommandBuffer.
++    virtual std::function<void(void* cmdbuf)> Record(u32 width, u32 height) = 0;
++};
++
+ class RendererBase : NonCopyable {
+ public:
+     explicit RendererBase(Core::System& system, Frontend::EmuWindow& window,
+@@ -64,6 +88,11 @@ public:
+     // if second == true then it is the second screen
+     virtual void NotifySurfaceChanged(bool second) {}
+ 
++    /// Draw `overlay` over the game screens (nullptr to stop).
++    void SetOverlay(Overlay* overlay_) {
++        overlay = overlay_;
++    }
++
+     /// Returns the resolution scale factor relative to the native 3DS screen resolution
+     u32 GetResolutionScaleFactor();
+ 
+@@ -105,6 +134,7 @@ public:
+                            const Layout::FramebufferLayout& layout);
+ 
+ protected:
++    Overlay* overlay = nullptr;
+     Core::System& system;
+     RendererSettings settings;
+     Frontend::EmuWindow& render_window;    /// Reference to the render window handle.
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.cpp b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+index 5221fdf15..aff128fe4 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -236,6 +236,24 @@ void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout&
+ 
+ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::FramebufferLayout& layout,
+                                     bool flipped) {
++    if (overlay && !overlay_ready && &window == &main_present_window) {
++        // The overlay uploads its resources with its own queue submission: make sure nothing
++        // else is using the queue
++        window.WaitPresent();
++        scheduler.Finish();
++        overlay->InitVulkan(VideoCore::Overlay::VulkanInfo{
++            .instance = static_cast<VkInstance>(instance.GetInstance()),
++            .physical_device = static_cast<VkPhysicalDevice>(instance.GetPhysicalDevice()),
++            .device = static_cast<VkDevice>(instance.GetDevice()),
++            .queue_family = instance.GetGraphicsQueueFamilyIndex(),
++            .queue = static_cast<VkQueue>(instance.GetGraphicsQueue()),
++            .render_pass = static_cast<VkRenderPass>(window.Renderpass()),
++            .api_version = instance.ApiVersion(),
++            .get_instance_proc_addr =
++                reinterpret_cast<void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr),
++        });
++        overlay_ready = true;
++    }
+     if (!Settings::values.use_skip_duplicate_frames.GetValue() ||
+         Core::PerfStats::game_frames_updated) {
+         Frame* frame = window.GetRenderFrame();
+@@ -1060,6 +1078,13 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout&
+ 
+     DrawCursor(layout);
+ 
++    if (overlay && overlay_ready) {
++        if (auto draw = overlay->Record(layout.width, layout.height)) {
++            scheduler.Record([draw = std::move(draw)](vk::CommandBuffer cmdbuf) {
++                draw(static_cast<VkCommandBuffer>(cmdbuf));
++            });
++        }
++    }
+     scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRenderPass(); });
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.h b/src/video_core/renderer_vulkan/renderer_vulkan.h
+index 2f1c26120..8d6bef46b 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.h
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.h
+@@ -153,6 +153,7 @@ private:
+     bool isSecondaryWindow;
+     bool secondaryWindowEnabled;
+     bool screenRendered;
++    bool overlay_ready = false;
+ };
+ 
+ } // namespace Vulkan

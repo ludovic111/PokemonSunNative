@@ -129,9 +129,42 @@ void GameWindow::OnResize() {
 }
 
 void GameWindow::ToggleFullscreen() {
-    fullscreen = !fullscreen;
+    SetFullscreen(!fullscreen);
+}
+
+void GameWindow::SetFullscreen(bool on) {
+    fullscreen = on;
     // Borderless at desktop resolution: instant alt-tab, no mode switch
     SDL_SetWindowFullscreen(window, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+}
+
+int GameWindow::CurrentMonitor() const {
+    return SDL_GetWindowDisplayIndex(window);
+}
+
+void GameWindow::MoveToMonitor(int index) {
+    if (index < 0 || index >= SDL_GetNumVideoDisplays())
+        return;
+    // On Wayland a fullscreen window goes to the monitor SDL thinks it is on, which follows the
+    // window position: leave fullscreen, move, and go fullscreen again (on that monitor)
+    const bool was_fullscreen = fullscreen;
+    if (was_fullscreen)
+        SDL_SetWindowFullscreen(window, 0);
+    SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED_DISPLAY(index),
+                          SDL_WINDOWPOS_CENTERED_DISPLAY(index));
+    if (was_fullscreen)
+        SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+}
+
+void GameWindow::SetMenuOpen(bool open) {
+    menu_open = open;
+    if (open) {
+        InputCommon::GetKeyboard()->ReleaseAllKeys();
+        TouchReleased();
+        SetTurbo(false);
+        SDL_ShowCursor(SDL_ENABLE);
+        cursor_visible = true;
+    }
 }
 
 void GameWindow::SetTurbo(bool on) {
@@ -242,6 +275,8 @@ void GameWindow::OnMouseWheel(s32 dy) {
 void GameWindow::PollEvents() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+        if (event_filter && event_filter(e))
+            continue;
         switch (e.type) {
         case SDL_WINDOWEVENT:
             switch (e.window.event) {
@@ -302,7 +337,7 @@ void GameWindow::PollEvents() {
     }
     ReleaseTappedKeys();
     // Hide the cursor after a few seconds without mouse movement
-    if (cursor_visible && SDL_GetTicks() - last_motion_ticks > 3000) {
+    if (cursor_visible && !menu_open && SDL_GetTicks() - last_motion_ticks > 3000) {
         SDL_ShowCursor(SDL_DISABLE);
         cursor_visible = false;
     }
