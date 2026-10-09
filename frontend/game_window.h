@@ -1,0 +1,72 @@
+// Copyright 2016-2026 Citra Emulator Project / Azahar Emulator Project / PokemonSunNative
+// Licensed under GPLv2 or any later version
+// Refer to the license.txt file included.
+
+// The game's window: SDL2 + Vulkan, with keyboard and mouse controls tuned for playing on a PC.
+
+#pragma once
+
+#include <atomic>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "common/common_types.h"
+#include "core/frontend/emu_window.h"
+
+union SDL_Event;
+struct SDL_Window;
+
+namespace Core {
+class System;
+}
+
+class GameWindow : public Frontend::EmuWindow {
+public:
+    GameWindow(Core::System& system, bool fullscreen);
+    ~GameWindow() override;
+
+    static void InitializeSDL();
+
+    void PollEvents() override;
+    std::unique_ptr<Frontend::GraphicsContext> CreateSharedContext() const override;
+
+    bool IsOpen() const {
+        return is_open;
+    }
+    void RequestClose() {
+        is_open = false;
+    }
+    /// The game pauses while the window is in the background.
+    bool IsFocused() const {
+        return focused;
+    }
+    /// Sets the window icon from the game's 48x48 RGB565 icon.
+    void SetIcon(const std::vector<u16>& rgb565, int size);
+    void SetTitle(const std::string& title);
+    void UpdatePerformanceInfo(double fps, double speed);
+
+private:
+    void OnKey(int scancode, bool pressed, bool repeat, u16 mods);
+    void OnMouseButton(u32 button, bool pressed, s32 x, s32 y);
+    void OnMouseMotion(s32 x, s32 y);
+    void OnMouseWheel(s32 dy);
+    void OnResize();
+    void ToggleFullscreen();
+    void TapKey(int scancode);
+    void ReleaseTappedKeys();
+    void SetTurbo(bool on);
+
+    Core::System& system;
+    SDL_Window* window = nullptr;
+    u32 window_id = 0;
+    std::atomic_bool is_open{true};
+    bool focused = true;
+    bool fullscreen = false;
+    bool turbo = false;
+    std::string title;
+    u32 last_motion_ticks = 0;
+    bool cursor_visible = true;
+    // Keys pressed on behalf of the mouse wheel, released a few frames later
+    std::vector<std::pair<int, u32>> tapped;
+};

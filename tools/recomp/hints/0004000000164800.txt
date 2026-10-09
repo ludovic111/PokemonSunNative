@@ -1,0 +1,4 @@
+# Function entries in Pokémon Sun that static analysis cannot find, one per line:
+#   <module> <hex address, | 1 for Thumb>
+# "static" is the main executable (absolute address); other modules use the offset in the .cro.
+# Taken from "no translated code there" crash reports (azahar_log.txt).

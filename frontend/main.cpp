@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <cstring>
 #include <thread>
 
 #define SDL_MAIN_HANDLED
@@ -23,7 +24,9 @@
 #include "core/frontend/applets/default_applets.h"
 #include "core/hle/service/cam/cam.h"
 #include "core/hle/service/service.h"
-#include "emu_window_sdl2_vk.h"
+#include "core/loader/loader.h"
+#include "core/loader/smdh.h"
+#include "game_window.h"
 #include "input_common/main.h"
 #include "network/network.h"
 #include "video_core/gpu.h"
@@ -135,8 +138,8 @@ int main(int argc, char** argv) {
     system.ApplySettings();
     Frontend::RegisterDefaultApplets(system);
 
-    EmuWindow_SDL2::InitializeSDL2();
-    auto window = std::make_unique<EmuWindow_SDL2_VK>(system, fullscreen, false);
+    GameWindow::InitializeSDL();
+    auto window = std::make_unique<GameWindow>(system, fullscreen);
     const auto scope = window->Acquire();
 
     const auto result = system.Load(*window, rom);
@@ -146,21 +149,42 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::thread render_thread([&window] { window->Present(); });
+    // Window title and icon from the game itself
+    std::vector<u8> smdh_data;
+    if (system.GetAppLoader().ReadIcon(smdh_data) == Loader::ResultStatus::Success &&
+        Loader::IsValidSMDH(smdh_data)) {
+        Loader::SMDH smdh;
+        std::memcpy(&smdh, smdh_data.data(), sizeof(smdh));
+        window->SetIcon(smdh.GetIcon(true), 48);
+    }
+    std::string title;
+    if (system.GetAppLoader().ReadTitle(title) == Loader::ResultStatus::Success && !title.empty())
+        window->SetTitle(title);
 
     std::atomic_bool stop_loading{false};
     system.GPU().Renderer().Rasterizer()->LoadDefaultDiskResources(stop_loading, nullptr);
 
+    u32 last_stats = SDL_GetTicks();
     while (window->IsOpen()) {
+        if (!window->IsFocused()) {
+            // Paused in the background: keep the window responsive, use no CPU
+            window->PollEvents();
+            SDL_Delay(20);
+            continue;
+        }
         const auto status = system.RunLoop();
         if (status == Core::System::ResultStatus::ShutdownRequested)
             window->RequestClose();
         else if (status != Core::System::ResultStatus::Success)
             LOG_ERROR(Frontend, "Run loop error {}: {}", static_cast<int>(status),
                       system.GetStatusDetails());
+        if (SDL_GetTicks() - last_stats > 1000) {
+            const auto stats = system.GetAndResetPerfStats();
+            window->UpdatePerformanceInfo(stats.game_fps, stats.emulation_speed);
+            last_stats = SDL_GetTicks();
+        }
     }
     window->RequestClose();
-    render_thread.join();
     Network::Shutdown();
     InputCommon::Shutdown();
     system.Shutdown();

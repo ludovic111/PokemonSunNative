@@ -26,6 +26,19 @@ def load_hints(title_id, module):
     return out
 
 
+def assign_ticks(dec, tool):
+    """Set each decoded instruction's cycle count from Azahar's table (via tools/tickcount)."""
+    import struct
+    import subprocess
+    insns = [i for i in dec.cache.values() if i is not None]
+    keys = sorted({(1 if i.thumb else 0, i.word) for i in insns})
+    data = b''.join(struct.pack('<BI', t, w) for t, w in keys)
+    out = subprocess.run([tool], input=data, stdout=subprocess.PIPE, check=True).stdout
+    ticks = dict(zip(keys, out))
+    for i in insns:
+        i.ticks = max(1, ticks.get((1 if i.thumb else 0, i.word), 1))
+
+
 TITLES = {
     0x0004000000164800: 'Pokémon Sun',
     0x0004000000175E00: 'Pokémon Moon',
@@ -37,6 +50,8 @@ def main(argv=None):
     ap.add_argument('rom')
     ap.add_argument('outdir')
     ap.add_argument('--only', help='comma-separated module names to translate (debugging)')
+    ap.add_argument('--tickcount', help="path to the tickcount tool (Azahar's ARM11 cycle table); "
+                    'without it every instruction counts as one cycle')
     args = ap.parse_args(argv)
     t0 = time.time()
     log = lambda *a: print(*a, flush=True)
@@ -110,6 +125,8 @@ def main(argv=None):
             results.append((set(), {}))
             continue
         dec, entries = analysis.discover(img, seeds, candidates)
+        if args.tickcount:
+            assign_ticks(dec, args.tickcount)
         _, labels = emit.write_image(img, dec, entries, args.outdir, log=log)
         results.append((entries, labels))
     emit.write_tables(images, results, args.outdir)

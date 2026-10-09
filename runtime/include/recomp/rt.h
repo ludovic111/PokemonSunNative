@@ -247,6 +247,10 @@ inline u32 ror(u32 v, u32 n) {
     return n ? (v >> n) | (v << (32 - n)) : v;
 }
 
+inline u32 clz(u32 v) {
+    return v ? u32(__builtin_clz(v)) : 32u;
+}
+
 inline u32 cpsr(const Cpu* c) {
     return (c->n << 31) | (c->z << 30) | (c->c << 29) | (c->v << 28) | (c->q << 27) |
            (c->ge << 16) | (c->t << 5) | c->cpsr_other;

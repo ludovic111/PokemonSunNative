@@ -26,10 +26,8 @@ set_target_properties(psn_game PROPERTIES UNITY_BUILD OFF)
 
 add_executable(pokemon-sun
     ${PSN_SOURCE_DIR}/frontend/main.cpp
-    ${PSN_SOURCE_DIR}/frontend/emu_window_sdl2.cpp
-    ${PSN_SOURCE_DIR}/frontend/emu_window_sdl2.h
-    ${PSN_SOURCE_DIR}/frontend/emu_window_sdl2_vk.cpp
-    ${PSN_SOURCE_DIR}/frontend/emu_window_sdl2_vk.h
+    ${PSN_SOURCE_DIR}/frontend/game_window.cpp
+    ${PSN_SOURCE_DIR}/frontend/game_window.h
 )
 target_include_directories(pokemon-sun PRIVATE ${PSN_SOURCE_DIR}/frontend)
 target_link_libraries(pokemon-sun PRIVATE psn_game psn_runtime citra_common citra_core video_core

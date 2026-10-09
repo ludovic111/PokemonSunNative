@@ -706,7 +706,7 @@ def decode(word, addr, ctx):
                 insn.interwork = True
             elif low == 0b0001 and op == 3:
                 insn.text = 'clz'
-                g.set_reg(bits(w, 15, 12), f'u32(__builtin_clzg({g.R(w & 0xF)}, 32))')
+                g.set_reg(bits(w, 15, 12), f'clz({g.R(w & 0xF)})')
             elif low == 0b0010 and op == 1:
                 insn.text = 'bxj'
                 g.emit(f'tgt = {g.R(w & 0xF)};')
