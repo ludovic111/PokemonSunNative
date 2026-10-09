@@ -248,9 +248,12 @@ void GameWindow::PollEvents() {
                 break;
             case SDL_WINDOWEVENT_FOCUS_LOST:
                 focused = false;
-                // Never leave a key stuck down while the window is in the background
-                InputCommon::GetKeyboard()->ReleaseAllKeys();
-                SetTurbo(false);
+                // Never leave a key stuck down while the window is in the background.
+                // (PSN_SYNTHETIC_INPUT: automated tests whose input tools steal focus.)
+                if (!std::getenv("PSN_SYNTHETIC_INPUT")) {
+                    InputCommon::GetKeyboard()->ReleaseAllKeys();
+                    SetTurbo(false);
+                }
                 break;
             case SDL_WINDOWEVENT_CLOSE:
                 RequestClose();

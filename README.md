@@ -4,9 +4,9 @@ Pokémon Sun as a native Linux program. The game's ARM code is **recompiled ahea
 x86-64**, in the spirit of the N64 and Xbox 360 recompilation projects, so no CPU emulation is
 involved. It's built for keyboard and mouse.
 
-> **Experimental.** The game boots, the language select, intro, naming, opening cutscenes and the
-> first overworld area work at full speed (30 FPS, the game's native frame rate) on an RTX 4080.
-> Large parts of the game have not been played through yet; see [Status](#status).
+> **Experimental.** From boot through the intro, naming and cutscenes, the house, and out onto
+> Route 1, everything has been played at full speed (30 FPS, the game's native frame rate) on an
+> RTX 4080. Most of the game has not been played through yet; see [Status](#status).
 
 **No game files are included.** You need your own decrypted dump of Pokémon Sun. Everything
 derived from it (the translated code, the executable) is built on your machine and stays there.
@@ -112,8 +112,9 @@ ones use RT64 for the RDP). The game logic itself runs as native code.
 
 ## Status
 
-- Works: boot, language selection, saving settings, the full intro with 3D cutscenes, the
-  in-game keyboard (with the mouse), the first overworld map (the player's room), walking.
+- Played and working: boot, language selection, saving settings, the intro with its 3D
+  cutscenes, the in-game keyboard (with the mouse), the house (all rooms, the bag and hat
+  event), leaving home, Route 1.
 - Not yet verified: battles, the rest of the story, Festival Plaza, online features (which
   need Nintendo's servers and will not work).
 - A crash saying `no translated code there` means the game reached code the analysis didn't
