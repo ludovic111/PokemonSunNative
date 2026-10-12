@@ -1,22 +1,36 @@
 # PokemonSunNative
 
-Pokémon Sun as a native Linux program. The game's ARM code is **recompiled ahead of time to
-x86-64**, in the spirit of the N64 and Xbox 360 recompilation projects, so no CPU emulation is
-involved. It's built for keyboard and mouse.
+Pokémon Sun recompiled ahead of time to native x86-64 Linux code, built for keyboard and mouse.
 
-> **Experimental.** From boot through the intro, naming and cutscenes, the house, and out onto
-> Route 1, everything has been played at full speed (30 FPS, the game's native frame rate) on an
-> RTX 4080. Most of the game has not been played through yet; see [Status](#status).
+**Status:** experimental, no releases. Playable from boot to Route 1; battles and the rest of the
+game are untested (see [Status](#status)).
+
+> **Not affiliated with or endorsed by Nintendo, Creatures Inc., GAME FREAK inc. or The Pokémon
+> Company.** This repository contains no game code, assets, keys or other game data. You need
+> your own legally obtained copy of Pokémon Sun, dumped by you from a cartridge you own; see
+> [Legal](#legal).
+
+## What it does
+
+The game's ARM code is **recompiled ahead of time to x86-64**, in the spirit of the N64 and Xbox
+360 recompilation projects, so no CPU emulation is involved. The 3DS operating system, GPU and
+audio come from [Azahar](https://github.com/azahar-emu/azahar)'s reimplementation; the game logic
+itself runs as native code. On top of that it adds a keyboard-and-mouse window, high resolutions,
+texture filters and display-rate frame interpolation.
+
+From boot through the intro, naming and cutscenes, the house, and out onto Route 1, everything
+has been played at full speed (30 FPS, the game's native frame rate) on a recent NVIDIA GPU. Most
+of the game has not been played through yet.
 
 **No game files are included.** You need your own decrypted dump of Pokémon Sun. Everything
 derived from it (the translated code, the executable) is built on your machine and stays there.
 
 ## Requirements
 
-- Linux x86-64 with a Vulkan GPU. Developed on an NVIDIA RTX 4080 (driver 595), Ubuntu 26.04.
+- Linux x86-64 with a Vulkan GPU. Developed and tested on an NVIDIA GPU with the proprietary driver.
 - About 8 GB free disk space (4 GB of it is the game itself), 8 GB of RAM or more.
-- A decrypted dump of **Pokémon Sun** (`.3ds` / `.cci`, or a `.7z` / `.zip` containing one).
-  Tested with *Pokémon Sun (Europe) (En,Ja,Fr,De,Es,It,Zh,Ko)*, v1.0 (the cartridge version).
+- Your own decrypted dump of **Pokémon Sun** (`.3ds` / `.cci`, or a `.7z` / `.zip` containing one).
+  Tested with the European multi-language cartridge release, v1.0.
   Encrypted dumps are refused.
 - Build tools and libraries:
 
@@ -189,15 +203,36 @@ ones use RT64 for the RDP). The game logic itself runs as native code.
 | `tests/fuzz/` | differential tester against dynarmic |
 | `build.sh` | one-command build and install |
 
-## Credits and license
+## Contributing
+
+Bug reports are welcome, especially `no translated code there` crashes (see [Status](#status)).
+Pull requests are welcome too. Never attach or commit game files, translated code from `build/`,
+or anything else extracted from the game.
+
+## Credits
 
 - [Azahar](https://github.com/azahar-emu/azahar) and the Citra project, whose 3DS OS, GPU and
   audio reimplementation this runs on, and whose SDL frontend the window code started from.
 - [dynarmic](https://github.com/azahar-emu/dynarmic), used as the reference CPU in the tests.
 - The N64Recomp, XenonRecomp and TriAevum projects showed this approach works.
 
-PokemonSunNative is licensed under the GNU GPL, version 2 or later (see `LICENSE`), like Azahar.
+## Licence
 
-Pokémon is © Nintendo, Creatures Inc. and GAME FREAK inc. This project is not affiliated with or
-endorsed by them. It contains no game code or assets. Use it only with a copy of the game you
-own.
+PokemonSunNative is licensed under the GNU GPL, version 2 or later (see [LICENSE](LICENSE)), like
+Azahar. The licence covers this project's own code only.
+
+## Legal
+
+Pokémon and Pokémon character names are trademarks of Nintendo, Creatures Inc. and GAME FREAK
+inc.; the game is © Nintendo, Creatures Inc., GAME FREAK inc. and The Pokémon Company. This
+project is not affiliated with, endorsed or sponsored by any of them.
+
+The repository contains only the recompiler, the runtime, the window code and a patch to Azahar: no ROM, no code or
+assets extracted from the game, no translated game code and no console keys. Use it only with a
+copy of Pokémon Sun that you own and dumped yourself. The code that `build.sh` translates from your
+dump, and the executable built from it, are derived from the game: keep them to yourself and do
+not share them.
+
+## Author
+
+Made by [Ludovic Marie](https://lu4ovic.com) ([@ludovic111](https://github.com/ludovic111)).
